@@ -1,0 +1,3069 @@
+--- a/include/linux/ipv6.h
++++ b/include/linux/ipv6.h
+@@ -56,6 +56,8 @@ struct ipv6_devconf {
+ 	__s32		force_tllao;
+ 	__s32           ndisc_notify;
+ 	__s32		suppress_frag_ndisc;
++	__s32		seg6_require_hmac;
++	__s32		seg6_enabled;
+ 	__s32		accept_ra_mtu;
+ 	__s32		drop_unsolicited_na;
+ 	struct ipv6_stable_secret {
+@@ -246,6 +248,7 @@ struct ipv6_pinfo {
+ 						 * 100: prefer care-of address
+ 						 */
+ 				dontfrag:1,
++				srhreverse:1,
+ 				autoflowlabel:1;
+ 	__u8			min_hopcount;
+ 	__u8			tclass;
+--- /dev/null
++++ b/include/linux/seg6.h
+@@ -0,0 +1,6 @@
++#ifndef _LINUX_SEG6_H
++#define _LINUX_SEG6_H
++
++#include <uapi/linux/seg6.h>
++
++#endif
+--- /dev/null
++++ b/include/linux/seg6_genl.h
+@@ -0,0 +1,6 @@
++#ifndef _LINUX_SEG6_GENL_H
++#define _LINUX_SEG6_GENL_H
++
++#include <uapi/linux/seg6_genl.h>
++
++#endif
+--- /dev/null
++++ b/include/linux/seg6_hmac.h
+@@ -0,0 +1,6 @@
++#ifndef _LINUX_SEG6_HMAC_H
++#define _LINUX_SEG6_HMAC_H
++
++#include <uapi/linux/seg6_hmac.h>
++
++#endif
+--- /dev/null
++++ b/include/linux/seg6_iptunnel.h
+@@ -0,0 +1,6 @@
++#ifndef _LINUX_SEG6_IPTUNNEL_H
++#define _LINUX_SEG6_IPTUNNEL_H
++
++#include <uapi/linux/seg6_iptunnel.h>
++
++#endif
+--- a/include/net/flow.h
++++ b/include/net/flow.h
+@@ -245,6 +245,14 @@ void flow_cache_flush_deferred(struct ne
+ extern atomic_t flow_cache_genid;
+ 
+ __u32 __get_hash_from_flowi6(const struct flowi6 *fl6, struct flow_keys *keys);
++__u32 ___get_hash_from_flowi6(const struct flowi6 *fl6, struct flow_keys *keys, u32 perturb);
++
++static inline __u32 get_hash_from_flowi6_perturb(const struct flowi6 *fl6, u32 perturb)
++{
++	struct flow_keys keys;
++
++	return ___get_hash_from_flowi6(fl6, &keys, perturb);
++}
+ 
+ static inline __u32 get_hash_from_flowi6(const struct flowi6 *fl6)
+ {
+--- a/include/net/ip6_route.h
++++ b/include/net/ip6_route.h
+@@ -64,6 +64,8 @@ static inline bool rt6_need_strict(const
+ 		(IPV6_ADDR_MULTICAST | IPV6_ADDR_LINKLOCAL | IPV6_ADDR_LOOPBACK);
+ }
+ 
++void ip6_route_input_gw(struct sk_buff *skb, struct in6_addr *gateway);
++
+ void ip6_route_input(struct sk_buff *skb);
+ struct dst_entry *ip6_route_input_lookup(struct net *net,
+ 					 struct net_device *dev,
+@@ -232,4 +234,6 @@ static inline struct in6_addr *rt6_nexth
+ 		return daddr;
+ }
+ 
++void ip6_route_set_l4flow(struct sk_buff *skb, struct flowi6 *fl6);
++
+ #endif
+--- a/include/net/ip6_tunnel.h
++++ b/include/net/ip6_tunnel.h
+@@ -69,6 +69,8 @@ struct ip6_tnl {
+ 	int encap_hlen; /* Encap header length (FOU,GUE) */
+ 	struct ip_tunnel_encap encap;
+ 	int mlink;
++
++	struct ipv6_txoptions *opt;
+ };
+ 
+ struct ip6_tnl_encap_ops {
+--- a/include/net/ipv6.h
++++ b/include/net/ipv6.h
+@@ -937,7 +937,8 @@ int ip6_local_out(struct net *net, struc
+  */
+ 
+ void ipv6_push_nfrag_opts(struct sk_buff *skb, struct ipv6_txoptions *opt,
+-			  u8 *proto, struct in6_addr **daddr_p);
++			  u8 *proto, struct in6_addr **daddr_p,
++			  struct in6_addr *saddr);
+ void ipv6_push_frag_opts(struct sk_buff *skb, struct ipv6_txoptions *opt,
+ 			 u8 *proto);
+ 
+--- a/include/net/netns/ipv6.h
++++ b/include/net/netns/ipv6.h
+@@ -36,6 +36,7 @@ struct netns_sysctl_ipv6 {
+ 	int idgen_retries;
+ 	int idgen_delay;
+ 	int flowlabel_state_ranges;
++	int ip6_rt_mphash_perturb;
+ };
+ 
+ struct netns_ipv6 {
+@@ -84,6 +85,7 @@ struct netns_ipv6 {
+ 	struct fib_rules_ops	*mr6_rules_ops;
+ #endif
+ #endif
++	struct seg6_pernet_data	*seg6_data;
+ 	atomic_t		dev_addr_genid;
+ 	atomic_t		fib6_sernum;
+ };
+--- /dev/null
++++ b/include/net/seg6.h
+@@ -0,0 +1,89 @@
++/*
++ *  SR-IPv6 implementation
++ *
++ *  Author:
++ *  David Lebrun <david.lebrun@uclouvain.be>
++ *
++ *
++ *  This program is free software; you can redistribute it and/or
++ *      modify it under the terms of the GNU General Public License
++ *      as published by the Free Software Foundation; either version
++ *      2 of the License, or (at your option) any later version.
++ */
++
++#ifndef _NET_SEG6_H
++#define _NET_SEG6_H
++
++#include <net/flow.h>
++#include <net/ip6_fib.h>
++#include <net/sock.h>
++#include <linux/ip.h>
++#include <linux/ipv6.h>
++#include <linux/route.h>
++#include <linux/seg6.h>
++#include <net/lwtunnel.h>
++#include <net/seg6_hmac.h>
++
++#define SEG6_VERSION_MAJOR  0
++#define SEG6_VERSION_MINOR  22
++
++extern int __init seg6_init(void);
++
++extern void seg6_srh_to_tmpl(struct ipv6_sr_hdr *hdr_from,
++            struct ipv6_sr_hdr *hdr_to, int reverse);
++
++extern struct seg6_action *seg6_action_lookup(struct net *net,
++                          struct in6_addr *segment);
++
++extern int seg6_nl_packet_in(struct net *net, struct sk_buff *skb,
++            void *act_data);
++
++#define SEG6_SRH_SEGSIZE(srh) ((srh)->first_segment + 1)
++
++struct seg6_action {
++    struct list_head list;
++
++    struct in6_addr segment;
++
++    int op;
++    void *data;
++    int datalen;
++    u32 flags;
++    /* NEXT:        NULL
++     * ROUTE:       struct in6_addr *
++     * INSERT:      <todo>
++     * TRANSLATE:   <todo>
++     * SERVICE:     u32 *
++     */
++};
++
++struct seg6_pernet_data {
++    spinlock_t lock;
++    struct seg6_hmac_info __rcu *hmac_table[SEG6_HMAC_MAX_KEY];
++    struct list_head actions;
++    struct in6_addr __rcu *tun_src;
++};
++
++extern int seg6_srh_reversal;
++
++static inline struct seg6_iptunnel_encap *seg6_lwtunnel_encap(struct lwtunnel_state *lwtstate)
++{
++    return (struct seg6_iptunnel_encap *)lwtstate->data;
++}
++
++static inline struct seg6_pernet_data *seg6_pernet(struct net *net)
++{
++    return net->ipv6.seg6_data;
++}
++
++static inline void seg6_pernet_lock(struct net *net)
++{
++    spin_lock(&seg6_pernet(net)->lock);
++}
++
++static inline void seg6_pernet_unlock(struct net *net)
++{
++    spin_unlock(&seg6_pernet(net)->lock);
++}
++
++#endif
+--- /dev/null
++++ b/include/net/seg6_hmac.h
+@@ -0,0 +1,55 @@
++/*
++ *  SR-IPv6 implementation
++ *
++ *  Author:
++ *  David Lebrun <david.lebrun@uclouvain.be>
++ *
++ *
++ *  This program is free software; you can redistribute it and/or
++ *      modify it under the terms of the GNU General Public License
++ *      as published by the Free Software Foundation; either version
++ *      2 of the License, or (at your option) any later version.
++ */
++
++#ifndef _NET_SEG6_HMAC_H
++#define _NET_SEG6_HMAC_H
++
++#include <net/flow.h>
++#include <net/ip6_fib.h>
++#include <net/sock.h>
++#include <linux/ip.h>
++#include <linux/ipv6.h>
++#include <linux/route.h>
++#include <net/seg6.h>
++#include <linux/seg6_hmac.h>
++
++#define SEG6_HMAC(s) ((s)->segments+SEG6_SRH_SEGSIZE(s))
++
++#define SEG6_HMAC_MAX_DIGESTSIZE    160
++
++struct seg6_hmac_info {
++    char secret[SEG6_HMAC_SECRET_LEN];
++    u8 slen;
++    u8 alg_id;
++};
++
++struct seg6_hmac_algo {
++    u8 alg_id;
++    char name[64];
++    struct crypto_shash * __percpu *tfms;
++    struct shash_desc * __percpu *shashs;
++};
++
++extern int seg6_hmac_compute(struct seg6_hmac_info *hinfo,
++                 struct ipv6_sr_hdr *hdr, struct in6_addr *saddr,
++                 u8 *output);
++extern int seg6_hmac_add_info(struct net *net, int key,
++                  const struct seg6_hmac_info *hinfo);
++extern int seg6_hmac_del_info(struct net *net, int key,
++                  const struct seg6_hmac_info *hinfo);
++extern int seg6_push_hmac(struct net *net, struct in6_addr *saddr,
++              struct ipv6_sr_hdr *srh);
++extern int seg6_hmac_init(void);
++extern void seg6_hmac_exit(void);
++
++#endif
+--- a/include/uapi/linux/if_tunnel.h
++++ b/include/uapi/linux/if_tunnel.h
+@@ -74,6 +74,7 @@ enum {
+ 	IFLA_IPTUN_ENCAP_FLAGS,
+ 	IFLA_IPTUN_ENCAP_SPORT,
+ 	IFLA_IPTUN_ENCAP_DPORT,
++	IFLA_IPTUN_EXTHDR,
+ 	IFLA_IPTUN_COLLECT_METADATA,
+ 	IFLA_IPTUN_FMRS,
+ 	__IFLA_IPTUN_MAX,
+--- a/include/uapi/linux/in6.h
++++ b/include/uapi/linux/in6.h
+@@ -284,6 +284,8 @@ struct in6_flowlabel_req {
+ #define IPV6_TRANSPARENT        75
+ #define IPV6_UNICAST_IF         76
+ 
++#define IPV6_SRHREVERSE		199
++
+ /*
+  * Multicast Routing:
+  * see include/uapi/linux/mroute6.h.
+--- a/include/uapi/linux/ip6_tunnel.h
++++ b/include/uapi/linux/ip6_tunnel.h
+@@ -48,4 +48,17 @@ struct ip6_tnl_parm2 {
+ 	__be32			o_key;
+ };
+ 
++struct ip6_tnl_txopts {
++	int tot_len;
++	__u16	opt_flen;
++	__u16	opt_nflen;
++
++	long hopopt_offset;
++	long dst0opt_offset;
++	long srcrt_offset;
++	long dst1opt_offset;
++
++	/* option data starts here */
++};
++
+ #endif
+--- a/include/uapi/linux/ipv6.h
++++ b/include/uapi/linux/ipv6.h
+@@ -39,6 +39,7 @@ struct in6_ifreq {
+ #define IPV6_SRCRT_STRICT	0x01	/* Deprecated; will be removed */
+ #define IPV6_SRCRT_TYPE_0	0	/* Deprecated; will be removed */
+ #define IPV6_SRCRT_TYPE_2	2	/* IPv6 type 2 Routing Header	*/
++#define IPV6_SRCRT_TYPE_4	4	/* Segment Routing Header */
+ 
+ /*
+  *	routing header
+@@ -167,6 +168,8 @@ enum {
+ 	DEVCONF_MLDV1_UNSOLICITED_REPORT_INTERVAL,
+ 	DEVCONF_MLDV2_UNSOLICITED_REPORT_INTERVAL,
+ 	DEVCONF_SUPPRESS_FRAG_NDISC,
++	DEVCONF_SEG6_REQUIRE_HMAC,
++	DEVCONF_SEG6_ENABLED,
+ 	DEVCONF_ACCEPT_RA_FROM_LOCAL,
+ 	DEVCONF_USE_OPTIMISTIC,
+ 	DEVCONF_ACCEPT_RA_MTU,
+--- a/include/uapi/linux/lwtunnel.h
++++ b/include/uapi/linux/lwtunnel.h
+@@ -9,6 +9,7 @@ enum lwtunnel_encap_types {
+ 	LWTUNNEL_ENCAP_IP,
+ 	LWTUNNEL_ENCAP_ILA,
+ 	LWTUNNEL_ENCAP_IP6,
++	LWTUNNEL_ENCAP_SEG6,
+ 	__LWTUNNEL_ENCAP_MAX,
+ };
+ 
+--- /dev/null
++++ b/include/uapi/linux/seg6.h
+@@ -0,0 +1,93 @@
++/*
++ *  SR-IPv6 implementation
++ *
++ *  Author:
++ *  David Lebrun <david.lebrun@uclouvain.be>
++ *
++ *
++ *  This program is free software; you can redistribute it and/or
++ *      modify it under the terms of the GNU General Public License
++ *      as published by the Free Software Foundation; either version
++ *      2 of the License, or (at your option) any later version.
++ */
++
++#ifndef _UAPI_LINUX_SEG6_H
++#define _UAPI_LINUX_SEG6_H
++
++/*
++ * SRH
++ */
++struct ipv6_sr_hdr {
++	__u8	nexthdr;
++	__u8	hdrlen;
++	__u8	type;
++	__u8	segments_left;
++	__u8	first_segment;
++
++	__u8	flag_1;
++	__u8	flag_2;
++
++	__u8	hmackeyid;
++
++	struct in6_addr segments[0];
++};
++
++#define SR6_FLAG_CLEANUP	0x08
++#define SR6_FLAG_PROTECTED	0x04
++#define SR6_FLAGMASK		0x0f
++
++#define sr_set_hmac_key_id(hdr, val) ((hdr)->hmackeyid = val)
++#define sr_get_hmac_key_id(hdr) ((hdr)->hmackeyid)
++
++static inline void sr_set_flags(struct ipv6_sr_hdr *hdr, int val)
++{
++	hdr->flag_1 = ((val & 0xF) << 4) | (hdr->flag_1 & 0xF);
++}
++
++static inline int sr_get_flags(struct ipv6_sr_hdr *hdr)
++{
++	return (hdr->flag_1 >> 4) & 0xF;
++}
++
++static inline void sr_set_flag_p1(struct ipv6_sr_hdr *hdr, int val)
++{
++	hdr->flag_1 = ((val & 0x7) << 1) | (hdr->flag_1 & 0xF1);
++}
++
++static inline int sr_get_flag_p1(struct ipv6_sr_hdr *hdr)
++{
++	return (hdr->flag_1 >> 1) & 0x7;
++}
++
++static inline void sr_set_flag_p2(struct ipv6_sr_hdr *hdr, int val)
++{
++	hdr->flag_1 = ((val & 0x7) >> 2) | (hdr->flag_1 & 0xFE);
++	hdr->flag_2 = ((val & 0x3) << 6) | (hdr->flag_2 & 0x3F);
++}
++
++static inline int sr_get_flag_p2(struct ipv6_sr_hdr *hdr)
++{
++	return ((hdr->flag_1 & 0x1) << 2) | ((hdr->flag_2 >> 6) & 0x3);
++}
++
++static inline void sr_set_flag_p3(struct ipv6_sr_hdr *hdr, int val)
++{
++	hdr->flag_2 = ((val & 0x7) << 3) | (hdr->flag_2 & 0xC7);
++}
++
++static inline int sr_get_flag_p3(struct ipv6_sr_hdr *hdr)
++{
++	return (hdr->flag_2 >> 3) & 0x7;
++}
++
++static inline void sr_set_flag_p4(struct ipv6_sr_hdr *hdr, int val)
++{
++	hdr->flag_2 = (val & 0x7) | (hdr->flag_2 & 0xF8);
++}
++
++static inline int sr_get_flag_p4(struct ipv6_sr_hdr *hdr)
++{
++	return hdr->flag_2 & 0x7;
++}
++
++#endif
+--- /dev/null
++++ b/include/uapi/linux/seg6_genl.h
+@@ -0,0 +1,62 @@
++#ifndef _UAPI_LINUX_SEG6_GENL_H
++#define _UAPI_LINUX_SEG6_GENL_H
++
++#define SEG6_GENL_NAME		"SEG6"
++#define SEG6_GENL_VERSION	0x1
++
++enum {
++	SEG6_ATTR_UNSPEC,
++	SEG6_ATTR_DST,
++	SEG6_ATTR_DSTLEN,
++	SEG6_ATTR_SEGLISTID,
++	SEG6_ATTR_FLAGS,
++	SEG6_ATTR_HMACKEYID,
++	SEG6_ATTR_SEGMENTS,
++	SEG6_ATTR_SEGLEN,
++	SEG6_ATTR_SEGINFO,
++	SEG6_ATTR_SECRET,
++	SEG6_ATTR_SECRETLEN,
++	SEG6_ATTR_ALGID,
++	SEG6_ATTR_HMACINFO,
++	SEG6_ATTR_BIND_OP,
++	SEG6_ATTR_BIND_DATA,
++	SEG6_ATTR_BIND_DATALEN,
++	SEG6_ATTR_BINDINFO,
++	SEG6_ATTR_PACKET_DATA,
++	SEG6_ATTR_PACKET_LEN,
++	SEG6_ATTR_POLICY_DATA,
++	SEG6_ATTR_POLICY_LEN,
++	__SEG6_ATTR_MAX,
++};
++
++#define SEG6_ATTR_MAX (__SEG6_ATTR_MAX - 1)
++
++enum {
++	SEG6_CMD_UNSPEC,
++	SEG6_CMD_SETHMAC,
++	SEG6_CMD_DUMPHMAC,
++	SEG6_CMD_ADDBIND,
++	SEG6_CMD_DELBIND,
++	SEG6_CMD_FLUSHBIND,
++	SEG6_CMD_DUMPBIND,
++	SEG6_CMD_PACKET_IN,
++	SEG6_CMD_PACKET_OUT,
++	SEG6_CMD_SET_TUNSRC,
++	SEG6_CMD_GET_TUNSRC,
++	__SEG6_CMD_MAX,
++};
++
++#define SEG6_CMD_MAX (__SEG6_CMD_MAX - 1)
++
++/* Binding-SID Information Base */
++#define SEG6_BIND_NEXT 0 /* aka no-op, classical sr processing */
++#define SEG6_BIND_ROUTE 1 /* force route through given next hop */
++#define SEG6_BIND_INSERT 2 /* push segments in srh */
++#define SEG6_BIND_TRANSLATE 3 /* translate source/dst ? */
++#define SEG6_BIND_SERVICE 4 /* send packet to virtual service */
++#define SEG6_BIND_OVERRIDE_NEXT 5 /* override next segment (break HMAC) */
++
++#define SEG6_BIND_FLAG_ASYM	0x01
++#define SEG6_BIND_FLAG_OVERRIDE	0x02 /* remove current action if exist */
++
++#endif
+--- /dev/null
++++ b/include/uapi/linux/seg6_hmac.h
+@@ -0,0 +1,13 @@
++#ifndef _UAPI_LINUX_SEG6_HMAC_H
++#define _UAPI_LINUX_SEG6_HMAC_H
++
++#define SEG6_HMAC_SECRET_LEN	64
++#define SEG6_HMAC_MAX_KEY	256
++#define SEG6_HMAC_FIELD_LEN	32
++
++enum {
++	SEG6_HMAC_ALGO_SHA1 = 1,
++	SEG6_HMAC_ALGO_SHA256 = 2,
++};
++
++#endif
+--- /dev/null
++++ b/include/uapi/linux/seg6_iptunnel.h
+@@ -0,0 +1,33 @@
++/*
++ *  SR-IPv6 implementation
++ *
++ *  Author:
++ *  David Lebrun <david.lebrun@uclouvain.be>
++ *
++ *
++ *  This program is free software; you can redistribute it and/or
++ *      modify it under the terms of the GNU General Public License
++ *      as published by the Free Software Foundation; either version
++ *      2 of the License, or (at your option) any later version.
++ */
++
++#ifndef _UAPI_LINUX_SEG6_IPTUNNEL_H
++#define _UAPI_LINUX_SEG6_IPTUNNEL_H
++
++enum {
++	SEG6_IPTUNNEL_UNSPEC,
++	SEG6_IPTUNNEL_SRH,
++	__SEG6_IPTUNNEL_MAX,
++};
++#define SEG6_IPTUNNEL_MAX (__SEG6_IPTUNNEL_MAX - 1)
++
++struct seg6_iptunnel_encap {
++	int flags;
++	struct ipv6_sr_hdr srh[0];
++};
++
++#define SEG6_IPTUN_ENCAP_SIZE(x) (sizeof(*(x)) + (((x)->srh->hdrlen + 1) << 3))
++
++#define SEG6_IPTUN_FLAG_ENCAP   0x1
++
++#endif
+--- a/net/core/flow_dissector.c
++++ b/net/core/flow_dissector.c
+@@ -887,7 +887,7 @@ u32 skb_get_poff(const struct sk_buff *s
+ 	return __skb_get_poff(skb, skb->data, &keys, skb_headlen(skb));
+ }
+ 
+-__u32 __get_hash_from_flowi6(const struct flowi6 *fl6, struct flow_keys *keys)
++__u32 ___get_hash_from_flowi6(const struct flowi6 *fl6, struct flow_keys *keys, u32 perturb)
+ {
+ 	memset(keys, 0, sizeof(*keys));
+ 
+@@ -902,8 +902,17 @@ __u32 __get_hash_from_flowi6(const struc
+ 	keys->tags.flow_label = (__force u32)fl6->flowlabel;
+ 	keys->basic.ip_proto = fl6->flowi6_proto;
+ 
++	if (perturb)
++		return __flow_hash_from_keys(keys, perturb);
++
+ 	return flow_hash_from_keys(keys);
+ }
++EXPORT_SYMBOL(___get_hash_from_flowi6);
++
++__u32 __get_hash_from_flowi6(const struct flowi6 *fl6, struct flow_keys *keys)
++{
++	return ___get_hash_from_flowi6(fl6, keys, 0);
++}
+ EXPORT_SYMBOL(__get_hash_from_flowi6);
+ 
+ __u32 __get_hash_from_flowi4(const struct flowi4 *fl4, struct flow_keys *keys)
+--- a/net/ipv6/Kconfig
++++ b/net/ipv6/Kconfig
+@@ -289,4 +289,11 @@ config IPV6_PIMSM_V2
+ 	  Support for IPv6 PIM multicast routing protocol PIM-SMv2.
+ 	  If unsure, say N.
+ 
++config IPV6_SEG6_IPTUNNEL
++	bool "IPv6: Segment Routing with IPv6 IP Tunnels support"
++	select LWTUNNEL
++	---help---
++	  Support for IPv6 SRH injection.
++	  If unsure, say N.
++
+ endif # IPV6
+--- a/net/ipv6/Makefile
++++ b/net/ipv6/Makefile
+@@ -24,7 +24,7 @@ ipv6-$(CONFIG_PROC_FS) += proc.o
+ ipv6-$(CONFIG_SYN_COOKIES) += syncookies.o
+ ipv6-$(CONFIG_NETLABEL) += calipso.o
+ 
+-ipv6-objs += $(ipv6-y)
++ipv6-objs += $(ipv6-y) seg6.o seg6_hmac.o
+ 
+ obj-$(CONFIG_INET6_AH) += ah6.o
+ obj-$(CONFIG_INET6_ESP) += esp6.o
+@@ -44,6 +44,7 @@ obj-$(CONFIG_IPV6_SIT) += sit.o
+ obj-$(CONFIG_IPV6_TUNNEL) += ip6_tunnel.o
+ obj-$(CONFIG_IPV6_GRE) += ip6_gre.o
+ obj-$(CONFIG_IPV6_FOU) += fou6.o
++obj-$(CONFIG_IPV6_SEG6_IPTUNNEL) += seg6_iptunnel.o
+ 
+ obj-y += addrconf_core.o exthdrs_core.o ip6_checksum.o ip6_icmp.o
+ obj-$(CONFIG_INET) += output_core.o protocol.o $(ipv6-offload)
+--- a/net/ipv6/addrconf.c
++++ b/net/ipv6/addrconf.c
+@@ -231,6 +231,8 @@ static struct ipv6_devconf ipv6_devconf
+ 	.disable_ipv6		= 0,
+ 	.accept_dad		= 1,
+ 	.suppress_frag_ndisc	= 1,
++	.seg6_require_hmac	= 0,
++	.seg6_enabled		= 1,
+ 	.accept_ra_mtu		= 1,
+ 	.stable_secret		= {
+ 		.initialized = false,
+@@ -277,6 +279,8 @@ static struct ipv6_devconf ipv6_devconf_
+ 	.disable_ipv6		= 0,
+ 	.accept_dad		= 1,
+ 	.suppress_frag_ndisc	= 1,
++	.seg6_require_hmac	= 0,
++	.seg6_enabled		= 1,
+ 	.accept_ra_mtu		= 1,
+ 	.stable_secret		= {
+ 		.initialized = false,
+@@ -4969,6 +4973,8 @@ static inline void ipv6_store_devconf(st
+ 	array[DEVCONF_FORCE_TLLAO] = cnf->force_tllao;
+ 	array[DEVCONF_NDISC_NOTIFY] = cnf->ndisc_notify;
+ 	array[DEVCONF_SUPPRESS_FRAG_NDISC] = cnf->suppress_frag_ndisc;
++	array[DEVCONF_SEG6_REQUIRE_HMAC] = cnf->seg6_require_hmac;
++	array[DEVCONF_SEG6_ENABLED] = cnf->seg6_enabled;
+ 	array[DEVCONF_ACCEPT_RA_FROM_LOCAL] = cnf->accept_ra_from_local;
+ 	array[DEVCONF_ACCEPT_RA_MTU] = cnf->accept_ra_mtu;
+ 	array[DEVCONF_IGNORE_ROUTES_WITH_LINKDOWN] = cnf->ignore_routes_with_linkdown;
+@@ -6008,6 +6014,20 @@ static const struct ctl_table addrconf_s
+ 		.maxlen		= sizeof(int),
+ 		.mode		= 0644,
+ 		.proc_handler	= proc_dointvec
++	},
++	{
++		.procname	= "seg6_require_hmac",
++		.data		= &ipv6_devconf.seg6_require_hmac,
++		.maxlen		= sizeof(int),
++		.mode		= 0644,
++		.proc_handler	= proc_dointvec
++	},
++	{
++		.procname	= "seg6_enabled",
++		.data		= &ipv6_devconf.seg6_enabled,
++		.maxlen		= sizeof(int),
++		.mode		= 0644,
++		.proc_handler	= proc_dointvec
+ 	},
+ 	{
+ 		.procname	= "accept_ra_from_local",
+--- a/net/ipv6/af_inet6.c
++++ b/net/ipv6/af_inet6.c
+@@ -61,6 +61,7 @@
+ #include <net/ip6_tunnel.h>
+ #endif
+ #include <net/calipso.h>
++#include <net/seg6.h>
+ 
+ #include <asm/uaccess.h>
+ #include <linux/mroute6.h>
+@@ -209,6 +210,7 @@ lookup_protocol:
+ 	np->mcast_hops	= IPV6_DEFAULT_MCASTHOPS;
+ 	np->mc_loop	= 1;
+ 	np->pmtudisc	= IPV6_PMTUDISC_WANT;
++	np->srhreverse	= seg6_srh_reversal;
+ 	np->autoflowlabel = ip6_default_np_autolabel(sock_net(sk));
+ 	sk->sk_ipv6only	= net->ipv6.sysctl.bindv6only;
+ 
+@@ -995,9 +997,13 @@ static int __init inet6_init(void)
+ 	if (err)
+ 		goto sysctl_fail;
+ #endif
++	err = seg6_init();
++	if (err)
++		goto seg6_fail;
+ out:
+ 	return err;
+ 
++seg6_fail:
+ #ifdef CONFIG_SYSCTL
+ sysctl_fail:
+ 	calipso_exit();
+--- a/net/ipv6/exthdrs.c
++++ b/net/ipv6/exthdrs.c
+@@ -48,6 +48,13 @@
+ #include <net/xfrm.h>
+ #endif
+ 
++#include <crypto/hash.h>
++#include <crypto/sha.h>
++#include <net/seg6.h>
++#include <net/seg6_hmac.h>
++#include <linux/seg6.h>
++#include <linux/seg6_genl.h>
++
+ #include <linux/uaccess.h>
+ 
+ /*
+@@ -286,6 +293,224 @@ static int ipv6_destopt_rcv(struct sk_bu
+ 	return -1;
+ }
+ 
++/* called with rcu_read_lock() */
++static int ipv6_srh_rcv(struct sk_buff *skb)
++{
++	struct inet6_skb_parm *opt = IP6CB(skb);
++	struct in6_addr *addr = NULL, *last_addr = NULL, *active_addr = NULL;
++	struct ipv6_sr_hdr *hdr;
++	struct net *net = dev_net(skb->dev);
++	int cleanup = 0;
++	u8 hmac_output[SEG6_HMAC_FIELD_LEN];
++	u8 *hmac_input;
++	u8 hmac_key_id;
++	int nh, srhlen;
++	struct inet6_dev *idev;
++	struct seg6_hmac_info *hinfo;
++	struct seg6_action *act;
++	struct in6_addr *neigh_rt = NULL;
++	struct seg6_pernet_data *sdata = seg6_pernet(net);
++	int accept_seg6;
++
++	hdr = (struct ipv6_sr_hdr *)skb_transport_header(skb);
++
++	if (ipv6_addr_is_multicast(&ipv6_hdr(skb)->daddr) ||
++	    skb->pkt_type != PACKET_HOST) {
++		__IP6_INC_STATS(net, ip6_dst_idev(skb_dst(skb)),
++				IPSTATS_MIB_INADDRERRORS);
++		kfree_skb(skb);
++		return -1;
++	}
++
++	idev = __in6_dev_get(skb->dev);
++
++	accept_seg6 = net->ipv6.devconf_all->seg6_enabled;
++	if (accept_seg6 > idev->cnf.seg6_enabled)
++		accept_seg6 = idev->cnf.seg6_enabled;
++
++	if (!accept_seg6) {
++		kfree_skb(skb);
++		return -1;
++	}
++
++	/* HMAC check */
++	hmac_key_id = sr_get_hmac_key_id(hdr);
++
++	if (idev->cnf.seg6_require_hmac > 0 && hmac_key_id == 0) {
++		pr_debug("SR-IPv6: require_hmac > 0 and hmac is not present\n");
++		kfree_skb(skb);
++		return -1;
++	}
++
++	if (idev->cnf.seg6_require_hmac >= 0 && hmac_key_id != 0) {
++		if (hdr->hdrlen < hdr->first_segment * 2 + 2 + 4) {
++			kfree_skb(skb);
++			return -1;
++		}
++
++		hinfo = rcu_dereference(sdata->hmac_table[hmac_key_id]);
++
++		if (!hinfo) {
++			pr_debug("SR-IPv6: no key found for keyid 0x%x\n",
++				 hmac_key_id);
++			kfree_skb(skb);
++			return -1;
++		}
++
++		if (seg6_hmac_compute(hinfo, hdr, &ipv6_hdr(skb)->saddr,
++				      hmac_output)) {
++			kfree_skb(skb);
++			return -1;
++		}
++
++		hmac_input = (u8 *)SEG6_HMAC(hdr);
++
++		if (memcmp(hmac_output, hmac_input, SEG6_HMAC_FIELD_LEN) != 0) {
++			pr_debug("SR-IPv6: HMAC failed, dropping packet\n");
++			kfree_skb(skb);
++			return -1;
++		}
++	}
++
++looped_back:
++	last_addr = hdr->segments;
++
++	if (hdr->segments_left > 0) {
++		if (hdr->nexthdr != NEXTHDR_IPV6 && hdr->segments_left == 1 &&
++		    sr_get_flags(hdr) & SR6_FLAG_CLEANUP)
++			cleanup = 1;
++	} else {
++		if (hdr->nexthdr == NEXTHDR_IPV6) {
++			int offset = (hdr->hdrlen + 1) << 3;
++
++			if (!pskb_pull(skb, offset)) {
++				kfree_skb(skb);
++				return -1;
++			}
++			skb_postpull_rcsum(skb, skb_transport_header(skb),
++					   offset);
++
++			skb_reset_network_header(skb);
++			skb_reset_transport_header(skb);
++			skb->encapsulation = 0;
++
++			__skb_tunnel_rx(skb, skb->dev, net);
++
++			netif_rx(skb);
++			return -1;
++		}
++
++		opt->srcrt = skb_network_header_len(skb);
++		opt->lastopt = opt->srcrt;
++		skb->transport_header += (hdr->hdrlen + 1) << 3;
++		opt->nhoff = (&hdr->nexthdr) - skb_network_header(skb);
++
++		return 1;
++	}
++
++	if (skb_cloned(skb)) {
++		if (pskb_expand_head(skb, 0, 0, GFP_ATOMIC)) {
++			__IP6_INC_STATS(net, ip6_dst_idev(skb_dst(skb)),
++					IPSTATS_MIB_OUTDISCARDS);
++			kfree_skb(skb);
++			return -1;
++		}
++	}
++
++	if (skb->ip_summed == CHECKSUM_COMPLETE)
++		skb->ip_summed = CHECKSUM_NONE;
++
++	hdr = (struct ipv6_sr_hdr *)skb_transport_header(skb);
++
++	active_addr = hdr->segments + hdr->segments_left;
++	hdr->segments_left--;
++	addr = hdr->segments + hdr->segments_left;
++
++	/* check if active segment is a Binding-SID */
++	act = seg6_action_lookup(net, active_addr);
++	if (act) {
++		switch (act->op) {
++		case SEG6_BIND_ROUTE:
++			neigh_rt = (struct in6_addr *)act->data;
++			break;
++		case SEG6_BIND_SERVICE:
++		{
++			int rc;
++
++			rc = seg6_nl_packet_in(net, skb, act->data);
++
++			if (!(act->flags & SEG6_BIND_FLAG_ASYM)) {
++				kfree_skb(skb);
++				return -1;
++			}
++
++			break;
++		}
++		case SEG6_BIND_OVERRIDE_NEXT:
++			memcpy(addr, act->data, sizeof(struct in6_addr));
++			break;
++		default:
++			break;
++		}
++	}
++
++	ipv6_hdr(skb)->daddr = *addr;
++
++	skb_push(skb, sizeof(struct ipv6hdr));
++
++	/* cleanup */
++
++	if (cleanup) {
++		srhlen = (hdr->hdrlen + 1) << 3;
++
++		nh = hdr->nexthdr;
++		memmove(skb_network_header(skb) + srhlen,
++			skb_network_header(skb),
++			(unsigned char *)hdr - skb_network_header(skb));
++		skb_pull(skb, srhlen);
++		skb->network_header += srhlen;
++		ipv6_hdr(skb)->nexthdr = nh;
++		ipv6_hdr(skb)->payload_len = htons(skb->len -
++						   sizeof(struct ipv6hdr));
++	}
++
++	skb_dst_drop(skb);
++
++	if (neigh_rt)
++		ip6_route_input_gw(skb, neigh_rt);
++	else
++		ip6_route_input(skb);
++
++	if (skb_dst(skb)->error) {
++		dst_input(skb);
++		return -1;
++	}
++
++	if (skb_dst(skb)->dev->flags & IFF_LOOPBACK) {
++		if (ipv6_hdr(skb)->hop_limit <= 1) {
++			__IP6_INC_STATS(net, ip6_dst_idev(skb_dst(skb)),
++					IPSTATS_MIB_INHDRERRORS);
++			icmpv6_send(skb, ICMPV6_TIME_EXCEED,
++				    ICMPV6_EXC_HOPLIMIT, 0);
++			kfree_skb(skb);
++			return -1;
++		}
++		ipv6_hdr(skb)->hop_limit--;
++
++		/* be sure that srh is still present before reinjecting */
++		if (!cleanup) {
++			skb_pull(skb, sizeof(struct ipv6hdr));
++			goto looped_back;
++		}
++		skb_set_transport_header(skb, sizeof(struct ipv6hdr));
++		IP6CB(skb)->nhoff = offsetof(struct ipv6hdr, nexthdr);
++	}
++
++	dst_input(skb);
++
++	return -1;
++}
++
+ /********************************
+   Routing header.
+  ********************************/
+@@ -318,6 +543,10 @@ static int ipv6_rthdr_rcv(struct sk_buff
+ 
+ 	hdr = (struct ipv6_rt_hdr *)skb_transport_header(skb);
+ 
++	/* segment routing */
++	if (hdr->type == IPV6_SRCRT_TYPE_4)
++		return ipv6_srh_rcv(skb);
++
+ 	if (ipv6_addr_is_multicast(&ipv6_hdr(skb)->daddr) ||
+ 	    skb->pkt_type != PACKET_HOST) {
+ 		__IP6_INC_STATS(net, ip6_dst_idev(skb_dst(skb)),
+@@ -681,27 +910,68 @@ int ipv6_parse_hopopts(struct sk_buff *s
+ 
+ static void ipv6_push_rthdr(struct sk_buff *skb, u8 *proto,
+ 			    struct ipv6_rt_hdr *opt,
+-			    struct in6_addr **addr_p)
++			    struct in6_addr **addr_p,
++			    struct in6_addr *saddr)
+ {
+ 	struct rt0_hdr *phdr, *ihdr;
++	struct ipv6_sr_hdr *sr_phdr, *sr_ihdr;
+ 	int hops;
+ 
+-	ihdr = (struct rt0_hdr *) opt;
++	/* skb->dev might be NULL, hence we fetch net namespace from socket */
++	struct net *net = NULL;
++
++	if (skb->dev)
++		net = dev_net(skb->dev);
++	else if (skb->sk)
++		net = sock_net(skb->sk);
++
++	if (!net)
++		BUG();
+ 
+-	phdr = (struct rt0_hdr *) skb_push(skb, (ihdr->rt_hdr.hdrlen + 1) << 3);
+-	memcpy(phdr, ihdr, sizeof(struct rt0_hdr));
++	if (opt->type == 4) {
++		int plen;
+ 
+-	hops = ihdr->rt_hdr.hdrlen >> 1;
++		sr_ihdr = (struct ipv6_sr_hdr *)opt;
++		plen = (sr_ihdr->hdrlen + 1) << 3;
+ 
+-	if (hops > 1)
+-		memcpy(phdr->addr, ihdr->addr + 1,
++		sr_phdr = (struct ipv6_sr_hdr *)skb_push(skb, plen);
++		memcpy(sr_phdr, sr_ihdr, sizeof(struct ipv6_sr_hdr));
++
++		hops = sr_ihdr->first_segment + 1;
++		memcpy(sr_phdr->segments + 1, sr_ihdr->segments + 1,
+ 		       (hops - 1) * sizeof(struct in6_addr));
+ 
+-	phdr->addr[hops - 1] = **addr_p;
+-	*addr_p = ihdr->addr;
++		sr_phdr->segments[0] = **addr_p;
++		*addr_p = &sr_ihdr->segments[hops - 1];
++
++		if (sr_phdr->hmackeyid) {
++			memset(SEG6_HMAC(sr_phdr), 0, 32);
++			seg6_push_hmac(net, saddr, sr_phdr);
++		}
++
++		sr_phdr->nexthdr = *proto;
++		*proto = NEXTHDR_ROUTING;
++	} else {
++		int plen;
++
++		ihdr = (struct rt0_hdr *)opt;
++		plen = (ihdr->rt_hdr.hdrlen + 1) << 3;
+ 
+-	phdr->rt_hdr.nexthdr = *proto;
+-	*proto = NEXTHDR_ROUTING;
++		phdr = (struct rt0_hdr *)skb_push(skb, plen);
++		memcpy(phdr, ihdr, sizeof(struct rt0_hdr));
++
++		hops = ihdr->rt_hdr.hdrlen >> 1;
++
++		if (hops > 1)
++			memcpy(phdr->addr, ihdr->addr + 1,
++			       (hops - 1) * sizeof(struct in6_addr));
++
++		phdr->addr[hops - 1] = **addr_p;
++		*addr_p = ihdr->addr;
++
++		phdr->rt_hdr.nexthdr = *proto;
++		*proto = NEXTHDR_ROUTING;
++	}
+ }
+ 
+ static void ipv6_push_exthdr(struct sk_buff *skb, u8 *proto, u8 type, struct ipv6_opt_hdr *opt)
+@@ -715,10 +985,10 @@ static void ipv6_push_exthdr(struct sk_b
+ 
+ void ipv6_push_nfrag_opts(struct sk_buff *skb, struct ipv6_txoptions *opt,
+ 			  u8 *proto,
+-			  struct in6_addr **daddr)
++			  struct in6_addr **daddr, struct in6_addr *saddr)
+ {
+ 	if (opt->srcrt) {
+-		ipv6_push_rthdr(skb, proto, opt->srcrt, daddr);
++		ipv6_push_rthdr(skb, proto, opt->srcrt, daddr, saddr);
+ 		/*
+ 		 * IPV6_RTHDRDSTOPTS is ignored
+ 		 * unless IPV6_RTHDR is set (RFC3542).
+@@ -945,7 +1215,13 @@ struct in6_addr *fl6_update_dst(struct f
+ 		return NULL;
+ 
+ 	*orig = fl6->daddr;
+-	fl6->daddr = *((struct rt0_hdr *)opt->srcrt)->addr;
++	if (opt->srcrt->type == 4) {
++		struct ipv6_sr_hdr *srhdr = (struct ipv6_sr_hdr *)opt->srcrt;
++
++		fl6->daddr = srhdr->segments[srhdr->first_segment];
++	} else {
++		fl6->daddr = *((struct rt0_hdr *)opt->srcrt)->addr;
++	}
+ 	return orig;
+ }
+ EXPORT_SYMBOL_GPL(fl6_update_dst);
+--- a/net/ipv6/ip6_output.c
++++ b/net/ipv6/ip6_output.c
+@@ -203,7 +203,8 @@ int ip6_xmit(const struct sock *sk, stru
+ 		if (opt->opt_flen)
+ 			ipv6_push_frag_opts(skb, opt, &proto);
+ 		if (opt->opt_nflen)
+-			ipv6_push_nfrag_opts(skb, opt, &proto, &first_hop);
++			ipv6_push_nfrag_opts(skb, opt, &proto, &first_hop,
++					     &fl6->saddr);
+ 	}
+ 
+ 	skb_push(skb, sizeof(struct ipv6hdr));
+@@ -1684,7 +1685,7 @@ struct sk_buff *__ip6_make_skb(struct so
+ 	if (opt && opt->opt_flen)
+ 		ipv6_push_frag_opts(skb, opt, &proto);
+ 	if (opt && opt->opt_nflen)
+-		ipv6_push_nfrag_opts(skb, opt, &proto, &final_dst);
++		ipv6_push_nfrag_opts(skb, opt, &proto, &final_dst, &fl6->saddr);
+ 
+ 	skb_push(skb, sizeof(struct ipv6hdr));
+ 	skb_reset_network_header(skb);
+--- a/net/ipv6/ip6_tunnel.c
++++ b/net/ipv6/ip6_tunnel.c
+@@ -1187,6 +1187,8 @@ int ip6_tnl_xmit(struct sk_buff *skb, st
+ 	bool use_cache = false;
+ 	u8 hop_limit;
+ 	int err = -1;
++	struct in6_addr *first_hop;
++	int nflen = 0;
+ 
+ 	if (t->parms.collect_md) {
+ 		hop_limit = skb_tunnel_info(skb)->key.ttl;
+@@ -1265,6 +1267,11 @@ route_lookup:
+ 		max_headroom += 8;
+ 		mtu -= 8;
+ 	}
++	if (t->opt) {
++		nflen = t->opt->opt_nflen;
++		max_headroom += nflen;
++		mtu -= nflen;
++	}
+ 	if (mtu < IPV6_MIN_MTU)
+ 		mtu = IPV6_MIN_MTU;
+ 	if (skb_dst(skb) && !t->parms.collect_md)
+@@ -1629,7 +1636,67 @@ ip6_tnl_change(struct ip6_tnl *t, const
+ 	return 0;
+ }
+ 
+-static int ip6_tnl_update(struct ip6_tnl *t, struct __ip6_tnl_parm *p)
++static void ip6_tnl_reset_mtu(struct ip6_tnl *t)
++{
++	struct net_device *dev = t->dev;
++	int mtu;
++
++	mtu = ETH_DATA_LEN - sizeof(struct ipv6hdr);
++	if (!(t->parms.flags & IP6_TNL_F_IGN_ENCAP_LIMIT))
++		mtu -= 8;
++	if (t->opt)
++		mtu -= t->opt->opt_nflen;
++
++	dev->mtu = mtu;
++}
++
++static int ip6_tnl_parse_exthdr(struct ip6_tnl *t, void *buf)
++{
++	struct ip6_tnl_txopts *topt;
++	struct ipv6_txoptions *opt, *old_opt;
++	int data_len;
++	void *data_start;
++
++	topt = (struct ip6_tnl_txopts *)buf;
++	data_len = topt->tot_len - sizeof(*topt);
++
++	opt = kzalloc(sizeof(*opt) + data_len, GFP_KERNEL);
++	if (!opt)
++		return -ENOMEM;
++
++	opt->tot_len = sizeof(*opt) + data_len;
++	opt->opt_flen = topt->opt_flen;
++	opt->opt_nflen = topt->opt_nflen;
++
++	data_start = (void *)opt + sizeof(*opt);
++	memcpy(data_start, (void *)topt + sizeof(*topt), data_len);
++
++	if (topt->hopopt_offset >= 0)
++		opt->hopopt = (struct ipv6_opt_hdr *)(data_start +
++						      topt->hopopt_offset);
++	if (topt->dst0opt_offset >= 0)
++		opt->dst0opt = (struct ipv6_opt_hdr *)(data_start +
++						       topt->dst0opt_offset);
++	if (topt->srcrt_offset >= 0)
++		opt->srcrt = (struct ipv6_rt_hdr *)(data_start +
++						    topt->srcrt_offset);
++	if (topt->dst1opt_offset >= 0)
++		opt->dst1opt = (struct ipv6_opt_hdr *)(data_start +
++						       topt->dst1opt_offset);
++
++	old_opt = t->opt;
++	t->opt = opt;
++
++	if (old_opt)
++		kfree(old_opt);
++
++	ip6_tnl_reset_mtu(t);
++
++	return 0;
++}
++
++static int ip6_tnl_update(struct ip6_tnl *t, struct __ip6_tnl_parm *p,
++			  void *opt)
+ {
+ 	struct net *net = t->net;
+ 	struct ip6_tnl_net *ip6n = net_generic(net, ip6_tnl_net_id);
+@@ -1638,6 +1705,8 @@ static int ip6_tnl_update(struct ip6_tnl
+ 	ip6_tnl_unlink(ip6n, t);
+ 	synchronize_net();
+ 	err = ip6_tnl_change(t, p);
++	if (opt)
++		err = ip6_tnl_parse_exthdr(t, opt);
+ 	ip6_tnl_link(ip6n, t);
+ 	netdev_state_change(t->dev);
+ 	return err;
+@@ -1764,7 +1833,7 @@ ip6_tnl_ioctl(struct net_device *dev, st
+ 			if (dev == ip6n->fb_tnl_dev)
+ 				err = ip6_tnl0_update(t, &p1);
+ 			else
+-				err = ip6_tnl_update(t, &p1);
++				err = ip6_tnl_update(t, &p1, NULL);
+ 		}
+ 		if (!IS_ERR(t)) {
+ 			err = 0;
+@@ -1922,6 +1991,9 @@ static void ip6_tnl_dev_setup(struct net
+ 	dev->netdev_ops = &ip6_tnl_netdev_ops;
+ 	dev->destructor = ip6_dev_free;
+ 
++	if (t->opt)
++		dev->mtu -= t->opt->opt_nflen;
++
+ 	dev->type = ARPHRD_TUNNEL6;
+ 	dev->flags |= IFF_NOARP;
+ 	dev->addr_len = sizeof(struct in6_addr);
+@@ -2165,6 +2237,7 @@ static int ip6_tnl_newlink(struct net *s
+ 	struct ip6_tnl_net *ip6n = net_generic(net, ip6_tnl_net_id);
+ 	struct ip6_tnl *nt, *t;
+ 	struct ip_tunnel_encap ipencap;
++	int err;
+ 
+ 	nt = netdev_priv(dev);
+ 
+@@ -2186,7 +2259,16 @@ static int ip6_tnl_newlink(struct net *s
+ 			return -EEXIST;
+ 	}
+ 
+-	return ip6_tnl_create2(dev);
++
++	err = ip6_tnl_create2(dev);
++	if (err)
++		return err;
++
++	if (data[IFLA_IPTUN_EXTHDR])
++		err = ip6_tnl_parse_exthdr(nt,
++					   nla_data(data[IFLA_IPTUN_EXTHDR]));
++
++	return err;
+ }
+ 
+ static int ip6_tnl_changelink(struct net_device *dev, struct nlattr *tb[],
+@@ -2218,16 +2300,26 @@ static int ip6_tnl_changelink(struct net
+ 	} else
+ 		t = netdev_priv(dev);
+ 
+-	return ip6_tnl_update(t, &p);
++	if (data[IFLA_IPTUN_EXTHDR])
++		opt = nla_data(data[IFLA_IPTUN_EXTHDR]);
++
++	return ip6_tnl_update(t, &p, opt);
+ }
+ 
+ static void ip6_tnl_dellink(struct net_device *dev, struct list_head *head)
+ {
+ 	struct net *net = dev_net(dev);
+ 	struct ip6_tnl_net *ip6n = net_generic(net, ip6_tnl_net_id);
++	struct ip6_tnl *t = netdev_priv(dev);
++	struct ipv6_txoptions *opt;
+ 
+-	if (dev != ip6n->fb_tnl_dev)
+-		unregister_netdevice_queue(dev, head);
++	if (dev != ip6n->fb_tnl_dev) {
++		opt = t->opt;
++		t->opt = NULL;
++		if (opt)
++			kfree(opt);
++ 		unregister_netdevice_queue(dev, head);
++	}
+ }
+ 
+ static size_t ip6_tnl_get_size(const struct net_device *dev)
+@@ -2293,6 +2385,7 @@ static int ip6_tnl_fill_info(struct sk_b
+ 	struct __ip6_tnl_fmr *c;
+ 	int fmrcnt = 0;
+ 	struct nlattr *fmrs;
++	struct ip6_tnl_txopts *topt;
+ 
+ 	if (nla_put_u32(skb, IFLA_IPTUN_LINK, parm->link) ||
+ 	    nla_put_in6_addr(skb, IFLA_IPTUN_LOCAL, &parm->laddr) ||
+@@ -2305,6 +2398,44 @@ static int ip6_tnl_fill_info(struct sk_b
+ 	    !(fmrs = nla_nest_start(skb, IFLA_IPTUN_FMRS)))
+ 		goto nla_put_failure;
+ 
++	if (tunnel->opt) {
++		int data_len, tot_len;
++		void *data_start;
++
++		data_start = (void *)tunnel->opt + sizeof(*tunnel->opt);
++		data_len = tunnel->opt->tot_len - sizeof(*tunnel->opt);
++		tot_len = data_len + sizeof(*topt);
++		topt = kzalloc(tot_len, GFP_KERNEL);
++		topt->tot_len = tot_len;
++		topt->opt_flen = tunnel->opt->opt_flen;
++		topt->opt_nflen = tunnel->opt->opt_nflen;
++		memcpy((void *)topt + sizeof(*topt), data_start, data_len);
++
++		if (tunnel->opt->hopopt)
++			topt->hopopt_offset = (void *)tunnel->opt->hopopt - data_start;
++		else
++			topt->hopopt_offset = -1;
++
++		if (tunnel->opt->dst0opt)
++			topt->dst0opt_offset = (void *)tunnel->opt->dst0opt - data_start;
++		else
++			topt->dst0opt_offset = -1;
++
++		if (tunnel->opt->srcrt)
++			topt->srcrt_offset = (void *)tunnel->opt->srcrt - data_start;
++		else
++			topt->srcrt_offset = -1;
++
++		if (tunnel->opt->dst1opt)
++			topt->dst1opt_offset = (void *)tunnel->opt->dst1opt - data_start;
++		else
++			topt->dst1opt_offset = -1;
++
++		if (nla_put(skb, IFLA_IPTUN_EXTHDR, tot_len, topt))
++			goto nla_put_failure_free;
++		kfree(topt);
++	}
++
+ 	for (c = parm->fmrs; c; c = c->next) {
+ 		struct nlattr *fmr = nla_nest_start(skb, ++fmrcnt);
+ 		if (!fmr ||
+@@ -2333,6 +2464,8 @@ static int ip6_tnl_fill_info(struct sk_b
+ 			goto nla_put_failure;
+ 	return 0;
+ 
++nla_put_failure_free:
++	kfree(topt);
+ nla_put_failure:
+ 	return -EMSGSIZE;
+ }
+@@ -2360,6 +2493,7 @@ static const struct nla_policy ip6_tnl_p
+ 	[IFLA_IPTUN_ENCAP_DPORT]	= { .type = NLA_U16 },
+ 	[IFLA_IPTUN_COLLECT_METADATA]	= { .type = NLA_FLAG },
+ 	[IFLA_IPTUN_FMRS]		= { .type = NLA_NESTED },
++	[IFLA_IPTUN_EXTHDR]		= { .type = NLA_BINARY },
+ };
+ 
+ static struct rtnl_link_ops ip6_link_ops __read_mostly = {
+--- a/net/ipv6/ipv6_sockglue.c
++++ b/net/ipv6/ipv6_sockglue.c
+@@ -430,6 +430,8 @@ static int do_ipv6_setsockopt(struct soc
+ 
+ 				break;
+ #endif
++			case IPV6_SRCRT_TYPE_4:
++				break;
+ 			default:
+ 				goto sticky_done;
+ 			}
+@@ -864,6 +866,10 @@ pref_skip_coa:
+ 		np->dontfrag = valbool;
+ 		retv = 0;
+ 		break;
++	case IPV6_SRHREVERSE:
++		np->srhreverse = valbool;
++		retv = 0;
++		break;
+ 	case IPV6_AUTOFLOWLABEL:
+ 		np->autoflowlabel = valbool;
+ 		retv = 0;
+--- a/net/ipv6/output_core.c
++++ b/net/ipv6/output_core.c
+@@ -7,6 +7,7 @@
+ #include <net/ipv6.h>
+ #include <net/ip6_fib.h>
+ #include <net/addrconf.h>
++#include <linux/netfilter_ipv6.h>
+ #include <net/secure_seq.h>
+ #include <linux/netfilter.h>
+ 
+--- a/net/ipv6/route.c
++++ b/net/ipv6/route.c
+@@ -449,19 +449,20 @@ static bool rt6_check_expired(const stru
+  * Adapted from fib_info_hashfn()
+  */
+ static int rt6_info_hash_nhsfn(unsigned int candidate_count,
+-			       const struct flowi6 *fl6)
++			       const struct flowi6 *fl6, u32 perturb)
+ {
+-	return get_hash_from_flowi6(fl6) % candidate_count;
++	return get_hash_from_flowi6_perturb(fl6, perturb) % candidate_count;
+ }
+ 
+ static struct rt6_info *rt6_multipath_select(struct rt6_info *match,
+ 					     struct flowi6 *fl6, int oif,
+-					     int strict)
++					     int strict, u32 perturb)
+ {
+ 	struct rt6_info *sibling, *next_sibling;
+ 	int route_choosen;
+ 
+-	route_choosen = rt6_info_hash_nhsfn(match->rt6i_nsiblings + 1, fl6);
++	route_choosen = rt6_info_hash_nhsfn(match->rt6i_nsiblings + 1, fl6,
++					    perturb);
+ 	/* Don't change the route, if route_choosen == 0
+ 	 * (siblings does not include ourself)
+ 	 */
+@@ -872,6 +873,7 @@ static struct rt6_info *ip6_pol_route_lo
+ {
+ 	struct fib6_node *fn;
+ 	struct rt6_info *rt;
++	u32 perturb = (u32)net->ipv6.sysctl.ip6_rt_mphash_perturb;
+ 
+ 	read_lock_bh(&table->tb6_lock);
+ 	fn = fib6_lookup(&table->tb6_root, &fl6->daddr, &fl6->saddr);
+@@ -879,7 +881,8 @@ restart:
+ 	rt = fn->leaf;
+ 	rt = rt6_device_match(net, rt, &fl6->saddr, fl6->flowi6_oif, flags);
+ 	if (rt->rt6i_nsiblings && fl6->flowi6_oif == 0)
+-		rt = rt6_multipath_select(rt, fl6, fl6->flowi6_oif, flags);
++		rt = rt6_multipath_select(rt, fl6, fl6->flowi6_oif, flags,
++					  perturb);
+ 	if (rt == net->ipv6.ip6_null_entry) {
+ 		fn = fib6_backtrack(fn, &fl6->saddr);
+ 		if (fn)
+@@ -1068,6 +1071,7 @@ struct rt6_info *ip6_pol_route(struct ne
+ 	struct fib6_node *fn, *saved_fn;
+ 	struct rt6_info *rt;
+ 	int strict = 0;
++	u32 perturb = (u32)net->ipv6.sysctl.ip6_rt_mphash_perturb;
+ 
+ 	strict |= flags & RT6_LOOKUP_F_IFACE;
+ 	strict |= flags & RT6_LOOKUP_F_IGNORE_LINKSTATE;
+@@ -1085,7 +1089,7 @@ struct rt6_info *ip6_pol_route(struct ne
+ redo_rt6_select:
+ 	rt = rt6_select(fn, oif, strict);
+ 	if (rt->rt6i_nsiblings)
+-		rt = rt6_multipath_select(rt, fl6, oif, strict);
++		rt = rt6_multipath_select(rt, fl6, oif, strict, perturb);
+ 	if (rt == net->ipv6.ip6_null_entry) {
+ 		fn = fib6_backtrack(fn, &fl6->saddr);
+ 		if (fn)
+@@ -1179,6 +1183,39 @@ struct dst_entry *ip6_route_input_lookup
+ }
+ EXPORT_SYMBOL_GPL(ip6_route_input_lookup);
+ 
++void ip6_route_input_gw(struct sk_buff *skb, struct in6_addr *gateway)
++{
++	const struct ipv6hdr *iph = ipv6_hdr(skb);
++	struct net *net = dev_net(skb->dev);
++	int flags = RT6_LOOKUP_F_HAS_SADDR;
++	struct flowi6 fl6 = {
++		.flowi6_iif = skb->dev->ifindex,
++		.daddr = *gateway,
++		.saddr = iph->saddr,
++		.flowlabel = ip6_flowinfo(iph),
++		.flowi6_mark = skb->mark,
++		.flowi6_proto = iph->nexthdr,
++	};
++
++	skb_dst_set(skb, ip6_route_input_lookup(net, skb->dev, &fl6, flags));
++}
++
++void ip6_route_set_l4flow(struct sk_buff *skb, struct flowi6 *fl6)
++{
++	const struct ipv6hdr *iph = ipv6_hdr(skb);
++
++	switch (iph->nexthdr) {
++	case NEXTHDR_TCP:
++	case NEXTHDR_UDP:
++		if (!pskb_may_pull(skb, skb_transport_offset(skb) + 4))
++			break;
++		fl6->fl6_sport = *(__be16 *)skb_transport_header(skb);
++		fl6->fl6_dport = *((__be16 *)skb_transport_header(skb) + 1);
++		break;
++	}
++}
++EXPORT_SYMBOL(ip6_route_set_l4flow);
++
+ void ip6_route_input(struct sk_buff *skb)
+ {
+ 	const struct ipv6hdr *iph = ipv6_hdr(skb);
+@@ -1197,6 +1234,9 @@ void ip6_route_input(struct sk_buff *skb
+ 	tun_info = skb_tunnel_info(skb);
+ 	if (tun_info && !(tun_info->mode & IP_TUNNEL_INFO_TX))
+ 		fl6.flowi6_tun_key.tun_id = tun_info->key.tun_id;
++
++	ip6_route_set_l4flow(skb, &fl6);
++
+ 	skb_dst_drop(skb);
+ 	skb_dst_set(skb, ip6_route_input_lookup(net, skb->dev, &fl6, flags));
+ }
+@@ -3674,6 +3714,13 @@ struct ctl_table ipv6_route_table_templa
+ 		.mode		=	0644,
+ 		.proc_handler	=	proc_dointvec_ms_jiffies,
+ 	},
++	{
++		.procname	=	"mphash_perturb",
++		.data		=	&init_net.ipv6.sysctl.ip6_rt_mphash_perturb,
++		.maxlen		=	sizeof(int),
++		.mode		=	0644,
++		.proc_handler	=	proc_dointvec,
++	},
+ 	{ }
+ };
+ 
+@@ -3697,6 +3744,7 @@ struct ctl_table * __net_init ipv6_route
+ 		table[7].data = &net->ipv6.sysctl.ip6_rt_mtu_expires;
+ 		table[8].data = &net->ipv6.sysctl.ip6_rt_min_advmss;
+ 		table[9].data = &net->ipv6.sysctl.ip6_rt_gc_min_interval;
++		table[10].data = &net->ipv6.sysctl.ip6_rt_mphash_perturb;
+ 
+ 		/* Don't export sysctls to unprivileged users */
+ 		if (net->user_ns != &init_user_ns)
+@@ -3771,6 +3819,7 @@ static int __net_init ip6_route_net_init
+ 	net->ipv6.sysctl.ip6_rt_gc_elasticity = 9;
+ 	net->ipv6.sysctl.ip6_rt_mtu_expires = 10*60*HZ;
+ 	net->ipv6.sysctl.ip6_rt_min_advmss = IPV6_MIN_MTU - 20 - 40;
++	net->ipv6.sysctl.ip6_rt_mphash_perturb = 0;
+ 
+ 	net->ipv6.ip6_rt_gc_expire = 30*HZ;
+ 
+--- /dev/null
++++ b/net/ipv6/seg6.c
+@@ -0,0 +1,843 @@
++/*
++ *  SR-IPv6 implementation
++ *
++ *  Author:
++ *  David Lebrun <david.lebrun@uclouvain.be>
++ *
++ *
++ *  This program is free software; you can redistribute it and/or
++ *	  modify it under the terms of the GNU General Public License
++ *	  as published by the Free Software Foundation; either version
++ *	  2 of the License, or (at your option) any later version.
++ */
++
++#include <linux/errno.h>
++#include <linux/types.h>
++#include <linux/socket.h>
++#include <linux/sockios.h>
++#include <linux/net.h>
++#include <linux/netdevice.h>
++#include <linux/in6.h>
++#include <linux/icmpv6.h>
++#include <linux/mroute6.h>
++#include <linux/slab.h>
++
++#include <linux/netfilter.h>
++#include <linux/netfilter_ipv6.h>
++
++#include <net/sock.h>
++#include <net/snmp.h>
++
++#include <net/ipv6.h>
++#include <net/protocol.h>
++#include <net/transp_v6.h>
++#include <net/rawv6.h>
++#include <net/ndisc.h>
++#include <net/ip6_route.h>
++#include <net/addrconf.h>
++#include <net/xfrm.h>
++
++#include <linux/cryptohash.h>
++#include <crypto/hash.h>
++#include <crypto/sha.h>
++#include <net/seg6.h>
++#include <net/genetlink.h>
++#include <net/seg6_hmac.h>
++#include <linux/seg6.h>
++#include <linux/random.h>
++#include <linux/seg6_genl.h>
++
++int seg6_srh_reversal;
++
++static void copy_segments_reverse(struct in6_addr *dst, struct in6_addr *src,
++				  int size)
++{
++	int i;
++
++	for (i = 0; i < size; i++)
++		memcpy(&dst[size - i - 1], &src[i], sizeof(struct in6_addr));
++}
++
++/* called with rcu_read_lock() */
++struct seg6_action *seg6_action_lookup(struct net *net,
++				       struct in6_addr *segment)
++{
++	struct seg6_pernet_data *sdata = seg6_pernet(net);
++	struct seg6_action *act;
++
++	list_for_each_entry_rcu(act, &sdata->actions, list) {
++		if (memcmp(&act->segment, segment, 16) == 0)
++			return act;
++	}
++
++	return NULL;
++}
++EXPORT_SYMBOL(seg6_action_lookup);
++
++static int seg6_action_add(struct net *net, struct seg6_action *act)
++{
++	struct seg6_pernet_data *sdata = seg6_pernet(net);
++	int err = 0;
++	struct seg6_action *old_act;
++
++	seg6_pernet_lock(net);
++	if ((old_act = seg6_action_lookup(net, &act->segment)) != NULL) {
++		if (act->flags & SEG6_BIND_FLAG_OVERRIDE) {
++			list_del_rcu(&old_act->list);
++		} else {
++			err = -EEXIST;
++			goto out_unlock;
++		}
++	}
++
++	list_add_rcu(&act->list, &sdata->actions);
++	seg6_pernet_unlock(net);
++
++	if (old_act) {
++		synchronize_net();
++		if (old_act->data)
++			kfree(old_act->data);
++		kfree(old_act);
++	}
++
++out:
++	return err;
++out_unlock:
++	seg6_pernet_unlock(net);
++	goto out;
++}
++
++static int seg6_action_del(struct net *net, struct in6_addr *dst)
++{
++	struct seg6_action *act;
++	int err = 0;
++
++	seg6_pernet_lock(net);
++	act = seg6_action_lookup(net, dst);
++	if (!act) {
++		err = -ENOENT;
++		goto out_unlock;
++	}
++	list_del_rcu(&act->list);
++	seg6_pernet_unlock(net);
++
++	synchronize_net();
++	if (act->data)
++		kfree(act->data);
++	kfree(act);
++
++out:
++	return err;
++out_unlock:
++	seg6_pernet_unlock(net);
++	goto out;
++}
++
++static void seg6_action_flush(struct net *net)
++{
++	struct seg6_pernet_data *sdata = seg6_pernet(net);
++	struct seg6_action *act;
++
++	seg6_pernet_lock(net);
++	while ((act = list_first_or_null_rcu(&sdata->actions,
++					     struct seg6_action,
++					     list)) != NULL) {
++		list_del_rcu(&act->list);
++		seg6_pernet_unlock(net);
++		synchronize_net();
++		if (act->data)
++			kfree(act->data);
++		kfree(act);
++		seg6_pernet_lock(net);
++	}
++
++	seg6_pernet_unlock(net);
++}
++
++void seg6_srh_to_tmpl(struct ipv6_sr_hdr *hdr_from, struct ipv6_sr_hdr *hdr_to,
++		      int reverse)
++{
++	int seg_size;
++
++	hdr_to->hdrlen = hdr_from->first_segment * 2 + 4;
++	hdr_to->type = IPV6_SRCRT_TYPE_4;
++	hdr_to->first_segment = hdr_from->first_segment;
++
++	seg_size = SEG6_SRH_SEGSIZE(hdr_from);
++	if (reverse)
++		copy_segments_reverse(hdr_to->segments + 1,
++				      hdr_from->segments + 1,
++				      seg_size - 1);
++	else
++		memcpy(hdr_to->segments + 1, hdr_from->segments + 1,
++		       (seg_size - 1) * sizeof(struct in6_addr));
++
++	memset(hdr_to->segments, 0x42, sizeof(struct in6_addr));
++}
++
++static struct nla_policy seg6_genl_policy[SEG6_ATTR_MAX + 1] = {
++	[SEG6_ATTR_DST]				= { .type = NLA_BINARY,
++		.len = sizeof(struct in6_addr) },
++	[SEG6_ATTR_DSTLEN]			= { .type = NLA_S32, },
++	[SEG6_ATTR_SEGLISTID]		= { .type = NLA_U16, },
++	[SEG6_ATTR_FLAGS]			= { .type = NLA_U32, },
++	[SEG6_ATTR_HMACKEYID]		= { .type = NLA_U8, },
++	[SEG6_ATTR_SEGMENTS]		= { .type = NLA_BINARY, },
++	[SEG6_ATTR_SEGLEN]			= { .type = NLA_S32, },
++	[SEG6_ATTR_SEGINFO]			= { .type = NLA_NESTED, },
++	[SEG6_ATTR_SECRET]			= { .type = NLA_BINARY, },
++	[SEG6_ATTR_SECRETLEN]		= { .type = NLA_U8, },
++	[SEG6_ATTR_ALGID]			= { .type = NLA_U8, },
++	[SEG6_ATTR_HMACINFO]		= { .type = NLA_NESTED, },
++	[SEG6_ATTR_BIND_OP]			= { .type = NLA_U8, },
++	[SEG6_ATTR_BIND_DATA]		= { .type = NLA_BINARY, },
++	[SEG6_ATTR_BIND_DATALEN]	= { .type = NLA_S32, },
++	[SEG6_ATTR_BINDINFO]		= {	.type = NLA_NESTED, },
++	[SEG6_ATTR_PACKET_DATA]		= { .type = NLA_BINARY, },
++	[SEG6_ATTR_PACKET_LEN]		= { .type = NLA_S32, },
++	[SEG6_ATTR_POLICY_DATA]		= { .type = NLA_BINARY, },
++	[SEG6_ATTR_POLICY_LEN]		= { .type = NLA_S32, },
++};
++
++static struct genl_family seg6_genl_family = {
++	.id = GENL_ID_GENERATE,
++	.hdrsize = 0,
++	.name = SEG6_GENL_NAME,
++	.version = SEG6_GENL_VERSION,
++	.maxattr = SEG6_ATTR_MAX,
++	.netnsok = true,
++};
++
++ /* @skb's SRH has undergone segleft dec
++ *
++ * We need to change DA to orig DA. When packet will be received in PACKET_OUT,
++ * then we just need to overwrite DA to active seg.
++ * SRH is not stripped, userland just has to follow header chain until transport
++ * is reached.
++ *
++ * /!\ We are in atomic context.
++ *
++ */
++int seg6_nl_packet_in(struct net *net, struct sk_buff *skb, void *act_data)
++{
++	struct sk_buff *skb2, *msg;
++	struct ipv6_sr_hdr *srhdr;
++	struct in6_addr *orig_da;
++	void *hdr;
++	int rc;
++	u32 portid;
++	struct sock *dst_sk;
++
++	portid = *(u32 *)act_data;
++	dst_sk = *(struct sock **)(act_data + sizeof(u32));
++
++	skb2 = skb_copy(skb, GFP_ATOMIC); /* linearize */
++	srhdr = (struct ipv6_sr_hdr *)skb_transport_header(skb2);
++
++	orig_da = srhdr->segments;
++	ipv6_hdr(skb2)->daddr = *orig_da;
++
++	skb_push(skb2, skb2->data - skb_network_header(skb2));
++
++	msg = genlmsg_new(NLMSG_DEFAULT_SIZE, GFP_ATOMIC);
++	if (!msg)
++		goto err;
++
++	hdr = genlmsg_put(msg, 0, 0, &seg6_genl_family, 0, SEG6_CMD_PACKET_IN);
++	if (!hdr)
++		goto err_free;
++
++	if (nla_put(msg, SEG6_ATTR_PACKET_DATA, skb2->len,
++		    skb_network_header(skb2)))
++		goto nla_put_failure;
++
++	if (nla_put_s32(msg, SEG6_ATTR_PACKET_LEN, skb2->len))
++		goto nla_put_failure;
++
++	genlmsg_end(msg, hdr);
++
++	rc = genlmsg_unicast(net, msg, portid);
++
++	kfree_skb(skb2);
++	return rc;
++
++nla_put_failure:
++	genlmsg_cancel(msg, hdr);
++err_free:
++	nlmsg_free(msg);
++err:
++	kfree_skb(skb2);
++	return -ENOMEM;
++}
++
++static int seg6_genl_packet_out(struct sk_buff *skb, struct genl_info *info)
++{
++	struct net *net = genl_info_net(info);
++	struct sk_buff *msg;
++	char *data;
++	int len;
++	struct ipv6_sr_hdr *srhdr;
++	struct ipv6hdr *hdr;
++	struct in6_addr *active_addr;
++	struct dst_entry *dst;
++	struct flowi6 fl6;
++	int err, hh_len;
++
++	if (!info->attrs[SEG6_ATTR_PACKET_DATA] ||
++	    !info->attrs[SEG6_ATTR_PACKET_LEN])
++		return -EINVAL;
++
++	len = nla_get_s32(info->attrs[SEG6_ATTR_PACKET_LEN]);
++	data = (char *)nla_data(info->attrs[SEG6_ATTR_PACKET_DATA]);
++
++	msg = alloc_skb(len, GFP_KERNEL);
++	if (!msg)
++		return -ENOMEM;
++
++	skb_put(msg, len);
++	skb_reset_network_header(msg);
++	skb_reset_transport_header(msg);
++
++	memcpy(msg->data, data, len);
++
++	hdr = ipv6_hdr(msg);
++
++	if (hdr->nexthdr != NEXTHDR_ROUTING) {
++		kfree_skb(msg);
++		return -EINVAL;
++	}
++
++	srhdr = (struct ipv6_sr_hdr *)(hdr + 1);
++
++	active_addr = srhdr->segments + srhdr->segments_left;
++	hdr->daddr = *active_addr;
++
++	memset(&fl6, 0, sizeof(fl6));
++	fl6.daddr = hdr->daddr;
++	fl6.saddr = hdr->saddr;
++	fl6.flowlabel = ((hdr->flow_lbl[0] & 0xF) << 16) |
++			 (hdr->flow_lbl[1] << 8) | hdr->flow_lbl[2];
++
++	msg->protocol = htons(ETH_P_IPV6);
++
++	if (srhdr->nexthdr == NEXTHDR_IPV6) {
++		int offset;
++
++		offset = sizeof(struct ipv6hdr) + ((srhdr->hdrlen + 1) << 3);
++		skb_set_inner_protocol(msg, msg->protocol);
++		skb_set_inner_network_header(msg, offset);
++		offset += sizeof(struct ipv6hdr);
++		skb_set_inner_transport_header(msg, offset);
++		skb->encapsulation = 1;
++	}
++
++	skb_set_transport_header(msg, sizeof(struct ipv6hdr));
++
++	skb_dst_drop(msg);
++
++	if ((unlikely(err = ip6_dst_lookup(net, NULL, &dst, &fl6)))) {
++		kfree_skb(msg);
++		return err;
++	}
++
++	skb_dst_set(msg, dst);
++	msg->dev = dst->dev;
++
++	hh_len = LL_RESERVED_SPACE(dst->dev);
++	if (skb_headroom(msg) < hh_len &&
++	    pskb_expand_head(msg, HH_DATA_ALIGN(hh_len - skb_headroom(msg)),
++			     0, GFP_KERNEL)) {
++		kfree_skb(msg);
++		return -ENOMEM;
++	}
++
++	return dst_output(net, NULL, msg);
++}
++
++static int seg6_genl_sethmac(struct sk_buff *skb, struct genl_info *info)
++{
++	struct net *net = genl_info_net(info);
++	char *secret;
++	u8 hmackeyid;
++	u8 algid;
++	u8 slen;
++	struct seg6_hmac_info *hinfo;
++	int err = 0;
++	struct seg6_pernet_data *sdata = seg6_pernet(net);
++
++	if (!info->attrs[SEG6_ATTR_HMACKEYID] ||
++	    !info->attrs[SEG6_ATTR_SECRETLEN] ||
++	    !info->attrs[SEG6_ATTR_ALGID])
++		return -EINVAL;
++
++	hmackeyid = nla_get_u8(info->attrs[SEG6_ATTR_HMACKEYID]);
++	slen = nla_get_u8(info->attrs[SEG6_ATTR_SECRETLEN]);
++	algid = nla_get_u8(info->attrs[SEG6_ATTR_ALGID]);
++
++	if (hmackeyid == 0)
++		return -EINVAL;
++
++	if (slen > SEG6_HMAC_SECRET_LEN)
++		return -EINVAL;
++
++	seg6_pernet_lock(net);
++
++	hinfo = sdata->hmac_table[hmackeyid];
++
++	if (!slen) {
++		if (!hinfo || seg6_hmac_del_info(net, hmackeyid, hinfo)) {
++			err = -ENOENT;
++		} else {
++			kfree(hinfo);
++		}
++		goto out_unlock;
++	}
++
++	if (!info->attrs[SEG6_ATTR_SECRET]) {
++		err = -EINVAL;
++		goto out_unlock;
++	}
++
++	if (hinfo) {
++		if (seg6_hmac_del_info(net, hmackeyid, hinfo)) {
++			err = -ENOENT;
++			goto out_unlock;
++		}
++		kfree(hinfo);
++	}
++
++	secret = (char *)nla_data(info->attrs[SEG6_ATTR_SECRET]);
++
++	hinfo = kzalloc(sizeof(*hinfo), GFP_KERNEL);
++	if (!hinfo) {
++		err = -ENOMEM;
++		goto out_unlock;
++	}
++
++	memcpy(hinfo->secret, secret, slen);
++	hinfo->slen = slen;
++	hinfo->alg_id = algid;
++
++	seg6_hmac_add_info(net, hmackeyid, hinfo);
++
++out_unlock:
++	seg6_pernet_unlock(net);
++	return err;
++}
++
++static int seg6_genl_set_tunsrc(struct sk_buff *skb, struct genl_info *info)
++{
++	struct net *net = genl_info_net(info);
++	struct seg6_pernet_data *sdata = seg6_pernet(net);
++	struct in6_addr *val, *t_old, *t_new;
++
++	if (!info->attrs[SEG6_ATTR_DST])
++		return -EINVAL;
++
++	val = (struct in6_addr *)nla_data(info->attrs[SEG6_ATTR_DST]);
++	t_new = kmemdup(val, sizeof(*val), GFP_KERNEL);
++
++	seg6_pernet_lock(net);
++
++	t_old = sdata->tun_src;
++	rcu_assign_pointer(sdata->tun_src, t_new);
++
++	seg6_pernet_unlock(net);
++
++	synchronize_net();
++	kfree(t_old);
++
++	return 0;
++}
++
++static int seg6_genl_get_tunsrc(struct sk_buff *skb, struct genl_info *info)
++{
++	struct net *net = genl_info_net(info);
++	struct sk_buff *msg;
++	void *hdr;
++	struct in6_addr *tun_src;
++
++	msg = genlmsg_new(NLMSG_DEFAULT_SIZE, GFP_KERNEL);
++	if (!msg)
++		return -ENOMEM;
++
++	hdr = genlmsg_put(msg, info->snd_portid, info->snd_seq,
++			  &seg6_genl_family, 0, SEG6_CMD_GET_TUNSRC);
++	if (!hdr)
++		goto free_msg;
++
++	rcu_read_lock();
++	tun_src = rcu_dereference(seg6_pernet(net)->tun_src);
++
++	if (nla_put(msg, SEG6_ATTR_DST, sizeof(struct in6_addr), tun_src))
++		goto nla_put_failure;
++
++	rcu_read_unlock();
++
++	genlmsg_end(msg, hdr);
++	genlmsg_reply(msg, info);
++
++	return 0;
++
++nla_put_failure:
++	rcu_read_unlock();
++	genlmsg_cancel(msg, hdr);
++free_msg:
++	nlmsg_free(msg);
++	return -ENOMEM;
++}
++
++static int __seg6_hmac_fill_info(int keyid, struct seg6_hmac_info *hinfo,
++				 struct sk_buff *msg)
++{
++	if (nla_put_u8(msg, SEG6_ATTR_HMACKEYID, keyid) ||
++	    nla_put_u8(msg, SEG6_ATTR_SECRETLEN, hinfo->slen) ||
++	    nla_put(msg, SEG6_ATTR_SECRET, hinfo->slen, hinfo->secret) ||
++	    nla_put_u8(msg, SEG6_ATTR_ALGID, hinfo->alg_id))
++		return -1;
++
++	return 0;
++}
++
++static int __seg6_genl_dumphmac_element(int keyid, struct seg6_hmac_info *hinfo,
++					u32 portid, u32 seq, u32 flags,
++					struct sk_buff *skb, u8 cmd)
++{
++	void *hdr;
++
++	hdr = genlmsg_put(skb, portid, seq, &seg6_genl_family, flags, cmd);
++	if (!hdr)
++		return -ENOMEM;
++
++	if (__seg6_hmac_fill_info(keyid, hinfo, skb) < 0)
++		goto nla_put_failure;
++
++	genlmsg_end(skb, hdr);
++	return 0;
++
++nla_put_failure:
++	genlmsg_cancel(skb, hdr);
++	return -EMSGSIZE;
++}
++
++static int seg6_genl_dumphmac(struct sk_buff *skb, struct netlink_callback *cb)
++{
++	struct net *net = sock_net(skb->sk);
++	struct seg6_hmac_info *hinfo;
++	int i, ret;
++
++	rcu_read_lock();
++	for (i = 0; i < 255; i++) {
++		if (i < cb->args[0])
++			continue;
++
++		hinfo = rcu_dereference(seg6_pernet(net)->hmac_table[i]);
++		if (!hinfo)
++			continue;
++
++		ret = __seg6_genl_dumphmac_element(i, hinfo,
++						   NETLINK_CB(cb->skb).portid,
++						   cb->nlh->nlmsg_seq,
++						   NLM_F_MULTI,
++						   skb, SEG6_CMD_DUMPHMAC);
++		if (ret)
++			break;
++	}
++	rcu_read_unlock();
++
++	cb->args[0] = i;
++	return skb->len;
++}
++
++static int seg6_genl_addbind(struct sk_buff *skb, struct genl_info *info)
++{
++	struct net *net = genl_info_net(info);
++	struct in6_addr *dst;
++	struct seg6_action *act;
++	int op, datalen, err = 0;
++
++	if (!info->attrs[SEG6_ATTR_DST] || !info->attrs[SEG6_ATTR_BIND_OP])
++		return -EINVAL;
++
++	dst = (struct in6_addr *)nla_data(info->attrs[SEG6_ATTR_DST]);
++	op = nla_get_u8(info->attrs[SEG6_ATTR_BIND_OP]);
++
++	if (!info->attrs[SEG6_ATTR_BIND_DATA] ||
++	    !info->attrs[SEG6_ATTR_BIND_DATALEN])
++		return -EINVAL;
++
++	act = kzalloc(sizeof(*act), GFP_KERNEL);
++	if (!act)
++		return -ENOMEM;
++
++	act->op = op;
++
++	if (info->attrs[SEG6_ATTR_FLAGS])
++		act->flags = nla_get_u32(info->attrs[SEG6_ATTR_FLAGS]);
++
++	if (op == SEG6_BIND_SERVICE) {
++		return -ENOSYS;
++	} else {
++		datalen = nla_get_s32(info->attrs[SEG6_ATTR_BIND_DATALEN]);
++		act->data = kzalloc(datalen, GFP_KERNEL);
++		if (!act->data) {
++			kfree(act);
++			return -ENOMEM;
++		}
++		act->datalen = datalen;
++		memcpy(act->data, nla_data(info->attrs[SEG6_ATTR_BIND_DATA]),
++		       datalen);
++	}
++
++	memcpy(&act->segment, dst, 16);
++
++	if (unlikely((err = seg6_action_add(net, act)) < 0))
++		goto out_free;
++
++out:
++	return err;
++out_free:
++	if (act->data)
++		kfree(act->data);
++	kfree(act);
++	goto out;
++}
++
++static int seg6_genl_delbind(struct sk_buff *skb, struct genl_info *info)
++{
++	struct net *net = genl_info_net(info);
++	struct in6_addr *dst;
++
++	if (!info->attrs[SEG6_ATTR_DST])
++		return -EINVAL;
++
++	dst = (struct in6_addr *)nla_data(info->attrs[SEG6_ATTR_DST]);
++
++	return seg6_action_del(net, dst);
++}
++
++static int seg6_genl_flushbind(struct sk_buff *skb, struct genl_info *info)
++{
++	struct net *net = genl_info_net(info);
++
++	seg6_action_flush(net);
++
++	return 0;
++}
++
++static int __seg6_bind_fill_info(struct seg6_action *act,
++				 struct sk_buff *msg)
++{
++	if (nla_put(msg, SEG6_ATTR_DST, sizeof(struct in6_addr),
++		    &act->segment) ||
++	    nla_put(msg, SEG6_ATTR_BIND_DATA, act->datalen, act->data) ||
++	    nla_put_s32(msg, SEG6_ATTR_BIND_DATALEN, act->datalen) ||
++	    nla_put_u8(msg, SEG6_ATTR_BIND_OP, act->op))
++		return -1;
++
++	return 0;
++}
++
++static int __seg6_genl_dumpbind_element(struct seg6_action *act, u32 portid,
++					u32 seq, u32 flags, struct sk_buff *skb,
++					u8 cmd)
++{
++	void *hdr;
++
++	hdr = genlmsg_put(skb, portid, seq, &seg6_genl_family, flags, cmd);
++	if (!hdr)
++		return -ENOMEM;
++
++	if (__seg6_bind_fill_info(act, skb) < 0)
++		goto nla_put_failure;
++
++	genlmsg_end(skb, hdr);
++	return 0;
++
++nla_put_failure:
++	genlmsg_cancel(skb, hdr);
++	return -EMSGSIZE;
++}
++
++static int seg6_genl_dumpbind(struct sk_buff *skb, struct netlink_callback *cb)
++{
++	struct net *net = sock_net(skb->sk);
++	struct seg6_pernet_data *sdata = seg6_pernet(net);
++	struct seg6_action *act;
++	int idx = 0, ret;
++
++	rcu_read_lock();
++
++	list_for_each_entry_rcu(act, &sdata->actions, list) {
++		if (idx++ < cb->args[0])
++			continue;
++
++		ret = __seg6_genl_dumpbind_element(act,
++						   NETLINK_CB(cb->skb).portid,
++						   cb->nlh->nlmsg_seq,
++						   NLM_F_MULTI, skb,
++						   SEG6_CMD_DUMPBIND);
++		if (ret)
++			break;
++	}
++
++	rcu_read_unlock();
++
++	cb->args[0] = idx;
++	return skb->len;
++}
++
++static struct genl_ops seg6_genl_ops[] = {
++	{
++		.cmd	= SEG6_CMD_SETHMAC,
++		.doit	= seg6_genl_sethmac,
++		.policy	= seg6_genl_policy,
++		.flags	= GENL_ADMIN_PERM,
++	},
++	{
++		.cmd	= SEG6_CMD_DUMPHMAC,
++		.dumpit	= seg6_genl_dumphmac,
++		.policy	= seg6_genl_policy,
++		.flags	= GENL_ADMIN_PERM,
++	},
++	{
++		.cmd	= SEG6_CMD_ADDBIND,
++		.doit	= seg6_genl_addbind,
++		.policy	= seg6_genl_policy,
++		.flags	= GENL_ADMIN_PERM,
++	},
++	{
++		.cmd	= SEG6_CMD_DELBIND,
++		.doit	= seg6_genl_delbind,
++		.policy	= seg6_genl_policy,
++		.flags	= GENL_ADMIN_PERM,
++	},
++	{
++		.cmd	= SEG6_CMD_FLUSHBIND,
++		.doit	= seg6_genl_flushbind,
++		.policy	= seg6_genl_policy,
++		.flags	= GENL_ADMIN_PERM,
++	},
++	{
++		.cmd	= SEG6_CMD_DUMPBIND,
++		.dumpit	= seg6_genl_dumpbind,
++		.policy	= seg6_genl_policy,
++		.flags	= GENL_ADMIN_PERM,
++	},
++	{
++		.cmd	= SEG6_CMD_PACKET_OUT,
++		.doit	= seg6_genl_packet_out,
++		.policy	= seg6_genl_policy,
++		.flags	= GENL_ADMIN_PERM,
++	},
++	{
++		.cmd	= SEG6_CMD_SET_TUNSRC,
++		.doit	= seg6_genl_set_tunsrc,
++		.policy	= seg6_genl_policy,
++		.flags	= GENL_ADMIN_PERM,
++	},
++	{
++		.cmd	= SEG6_CMD_GET_TUNSRC,
++		.doit 	= seg6_genl_get_tunsrc,
++		.policy = seg6_genl_policy,
++		.flags	= GENL_ADMIN_PERM,
++	},
++};
++
++static struct ctl_table seg6_table[] = {
++	{
++		.procname	= "srh_reversal",
++		.data		= &seg6_srh_reversal,
++		.maxlen		= sizeof(int),
++		.mode		= 0644,
++		.proc_handler	= &proc_dointvec
++	},
++	{ }
++};
++
++static struct ctl_table_header *seg6_table_hdr;
++
++static int __net_init seg6_net_init(struct net *net)
++{
++	struct seg6_pernet_data *sdata;
++
++	net->ipv6.seg6_data = kzalloc(sizeof(struct seg6_pernet_data),
++				      GFP_KERNEL);
++
++	sdata = seg6_pernet(net);
++	if (!sdata)
++		return -ENOMEM;
++
++	spin_lock_init(&sdata->lock);
++
++	sdata->tun_src = kzalloc(sizeof(struct in6_addr), GFP_KERNEL);
++
++	INIT_LIST_HEAD(&sdata->actions);
++
++	return 0;
++}
++
++static void __net_exit seg6_net_exit(struct net *net)
++{
++	struct seg6_pernet_data *sdata = seg6_pernet(net);
++	int i;
++
++	seg6_action_flush(net);
++
++	for (i = 0; i < SEG6_HMAC_MAX_KEY; i++) {
++		if (sdata->hmac_table[i])
++			kfree(sdata->hmac_table[i]);
++	}
++
++	kfree(sdata->tun_src);
++	kfree(seg6_pernet(net));
++}
++
++static struct pernet_operations ip6_segments_ops = {
++	.init = seg6_net_init,
++	.exit = seg6_net_exit,
++};
++
++int __init seg6_init(void)
++{
++	int err = -ENOMEM;
++
++#ifdef CONFIG_SYSCTL
++	seg6_table_hdr = register_net_sysctl(&init_net, "net/seg6", seg6_table);
++	if (!seg6_table_hdr)
++		goto out;
++#endif
++	err = genl_register_family_with_ops(&seg6_genl_family, seg6_genl_ops);
++	if (err)
++		goto out_unregister_sysctl;
++	err = register_pernet_subsys(&ip6_segments_ops);
++	if (err)
++		goto out_unregister_genl;
++	err = seg6_hmac_init();
++	if (err)
++		goto out_unregister_pernet;
++
++	pr_info("SR-IPv6: Release v%d.%d\n", SEG6_VERSION_MAJOR,
++		SEG6_VERSION_MINOR);
++out:
++	return err;
++out_unregister_pernet:
++	unregister_pernet_subsys(&ip6_segments_ops);
++out_unregister_genl:
++	genl_unregister_family(&seg6_genl_family);
++out_unregister_sysctl:
++#ifdef CONFIG_SYSCTL
++	unregister_net_sysctl_table(seg6_table_hdr);
++#endif
++	goto out;
++}
++
++void __exit seg6_exit(void)
++{
++	seg6_hmac_exit();
++	unregister_pernet_subsys(&ip6_segments_ops);
++	genl_unregister_family(&seg6_genl_family);
++#ifdef CONFIG_SYSCTL
++	unregister_net_sysctl_table(seg6_table_hdr);
++#endif
++}
+--- /dev/null
++++ b/net/ipv6/seg6_hmac.c
+@@ -0,0 +1,323 @@
++/*
++ *  SR-IPv6 implementation -- HMAC functions
++ *
++ *  Author:
++ *  David Lebrun <david.lebrun@uclouvain.be>
++ *
++ *
++ *  This program is free software; you can redistribute it and/or
++ *      modify it under the terms of the GNU General Public License
++ *      as published by the Free Software Foundation; either version
++ *      2 of the License, or (at your option) any later version.
++ */
++
++#include <linux/errno.h>
++#include <linux/types.h>
++#include <linux/socket.h>
++#include <linux/sockios.h>
++#include <linux/net.h>
++#include <linux/netdevice.h>
++#include <linux/in6.h>
++#include <linux/icmpv6.h>
++#include <linux/mroute6.h>
++#include <linux/slab.h>
++
++#include <linux/netfilter.h>
++#include <linux/netfilter_ipv6.h>
++
++#include <net/sock.h>
++#include <net/snmp.h>
++
++#include <net/ipv6.h>
++#include <net/protocol.h>
++#include <net/transp_v6.h>
++#include <net/rawv6.h>
++#include <net/ndisc.h>
++#include <net/ip6_route.h>
++#include <net/addrconf.h>
++#include <net/xfrm.h>
++
++#include <linux/cryptohash.h>
++#include <crypto/hash.h>
++#include <crypto/sha.h>
++#include <net/seg6.h>
++#include <net/genetlink.h>
++#include <net/seg6_hmac.h>
++#include <linux/random.h>
++
++static char * __percpu *hmac_ring;
++
++static struct seg6_hmac_algo hmac_algos[] = {
++	{
++		.alg_id = SEG6_HMAC_ALGO_SHA1,
++		.name = "hmac(sha1)",
++	},
++	{
++		.alg_id = SEG6_HMAC_ALGO_SHA256,
++		.name = "hmac(sha256)",
++	},
++};
++
++static struct seg6_hmac_algo *__hmac_get_algo(u8 alg_id)
++{
++	int i, alg_count;
++	struct seg6_hmac_algo *algo;
++
++	alg_count = sizeof(hmac_algos)/sizeof(struct seg6_hmac_algo);
++	for (i = 0; i < alg_count; i++) {
++		algo = &hmac_algos[i];
++		if (algo->alg_id == alg_id)
++			return algo;
++	}
++
++	return NULL;
++}
++
++static int __do_hmac(struct seg6_hmac_info *hinfo, const char *text, u8 psize,
++		     u8 *output, int outlen)
++{
++	struct crypto_shash *tfm;
++	struct shash_desc *shash;
++	struct seg6_hmac_algo *algo;
++	int ret, dgsize;
++
++	algo = __hmac_get_algo(hinfo->alg_id);
++	if (!algo)
++		return -ENOENT;
++
++	tfm = *this_cpu_ptr(algo->tfms);
++
++	dgsize = crypto_shash_digestsize(tfm);
++	if (dgsize > outlen) {
++		pr_debug("sr-ipv6: __do_hmac: digest size too big (%d / %d)\n",
++			 dgsize, outlen);
++		return -ENOMEM;
++	}
++
++	ret = crypto_shash_setkey(tfm, hinfo->secret, hinfo->slen);
++	if (ret < 0) {
++		pr_debug("sr-ipv6: crypto_shash_setkey failed: err %d\n", ret);
++		goto failed;
++	}
++
++	shash = *this_cpu_ptr(algo->shashs);
++	shash->tfm = tfm;
++
++	ret = crypto_shash_digest(shash, text, psize, output);
++	if (ret < 0) {
++		pr_debug("sr-ipv6: crypto_shash_digest failed: err %d\n", ret);
++		goto failed;
++	}
++
++	return dgsize;
++
++failed:
++	return ret;
++}
++
++int seg6_hmac_compute(struct seg6_hmac_info *hinfo, struct ipv6_sr_hdr *hdr,
++		      struct in6_addr *saddr, u8 *output)
++{
++	int plen, i, dgsize, wrsize;
++	char *ring, *off;
++	u8 tmp_out[SEG6_HMAC_MAX_DIGESTSIZE];
++
++	/* a 160-byte buffer for digest output allows to store highest known
++	 * hash function (RadioGatun) with up to 1216 bits
++	 */
++
++	/* saddr(16) + first_seg(1) + cleanup(1) + keyid(1) + seglist(16n) */
++	plen = 16 + 1 + 1 + 1 + (hdr->first_segment + 1) * 16;
++
++	/* this limit allows for 14 segments */
++	if (plen > 255)
++		return -EMSGSIZE;
++
++	local_bh_disable();
++	off = ring = *this_cpu_ptr(hmac_ring);
++	memcpy(off, saddr, 16);
++	off += 16;
++	*off++ = hdr->first_segment;
++	*off++ = !!(sr_get_flags(hdr) & SR6_FLAG_CLEANUP) << 7;
++	*off++ = hdr->hmackeyid;
++
++	for (i = 0; i < hdr->first_segment + 1; i++) {
++		memcpy(off, hdr->segments + i, 16);
++		off += 16;
++	}
++
++	dgsize = __do_hmac(hinfo, ring, plen, tmp_out,
++			   SEG6_HMAC_MAX_DIGESTSIZE);
++	local_bh_enable();
++
++	if (dgsize < 0)
++		return dgsize;
++
++	wrsize = SEG6_HMAC_FIELD_LEN;
++	if (wrsize > dgsize)
++		wrsize = dgsize;
++
++	memset(output, 0, SEG6_HMAC_FIELD_LEN);
++	memcpy(output, tmp_out, wrsize);
++
++	return 0;
++}
++EXPORT_SYMBOL(seg6_hmac_compute);
++
++int seg6_hmac_add_info(struct net *net, int key,
++		       const struct seg6_hmac_info *hinfo)
++{
++	struct seg6_pernet_data *sdata = seg6_pernet(net);
++
++	return !cmpxchg((const struct seg6_hmac_info **)&sdata->hmac_table[key],
++			NULL, hinfo) ? 0 : -1;
++}
++EXPORT_SYMBOL(seg6_hmac_add_info);
++
++int seg6_hmac_del_info(struct net *net, int key,
++		       const struct seg6_hmac_info *hinfo)
++{
++	struct seg6_pernet_data *sdata = seg6_pernet(net);
++	int ret;
++
++	ret = (cmpxchg((const struct seg6_hmac_info **)&sdata->hmac_table[key],
++		       hinfo, NULL) == hinfo) ? 0 : -1;
++
++	synchronize_net();
++
++	return ret;
++}
++EXPORT_SYMBOL(seg6_hmac_del_info);
++
++int seg6_push_hmac(struct net *net, struct in6_addr *saddr,
++		   struct ipv6_sr_hdr *srh)
++{
++	struct seg6_hmac_info *hinfo;
++	int err = -ENOENT;
++
++	rcu_read_lock();
++
++	hinfo = rcu_dereference(seg6_pernet(net)->hmac_table[srh->hmackeyid]);
++
++	if (!hinfo) {
++		rcu_read_unlock();
++		goto out;
++	}
++
++	err = seg6_hmac_compute(hinfo, srh, saddr, (u8 *)SEG6_HMAC(srh));
++
++	rcu_read_unlock();
++
++out:
++	return err;
++}
++EXPORT_SYMBOL(seg6_push_hmac);
++
++static int seg6_hmac_init_ring(void)
++{
++	int i;
++
++	hmac_ring = alloc_percpu(char *);
++
++	if (!hmac_ring)
++		return -ENOMEM;
++
++	for_each_possible_cpu(i) {
++		char *ring = kzalloc(256, GFP_KERNEL);
++
++		if (!ring)
++			return -ENOMEM;
++
++		*per_cpu_ptr(hmac_ring, i) = ring;
++	}
++
++	return 0;
++}
++
++static int seg6_hmac_init_algo(void)
++{
++	int i, alg_count, cpu;
++	struct seg6_hmac_algo *algo;
++	struct crypto_shash *tfm;
++	struct shash_desc *shash;
++
++	alg_count = sizeof(hmac_algos)/sizeof(struct seg6_hmac_algo);
++
++	for (i = 0; i < alg_count; i++) {
++		int shsize;
++		struct crypto_shash **p_tfm;
++
++		algo = &hmac_algos[i];
++		algo->tfms = alloc_percpu(struct crypto_shash *);
++		if (!algo->tfms)
++			return -ENOMEM;
++
++		for_each_possible_cpu(cpu) {
++			tfm = crypto_alloc_shash(algo->name, 0, GFP_KERNEL);
++			if (IS_ERR(tfm))
++				return PTR_ERR(tfm);
++			p_tfm = per_cpu_ptr(algo->tfms, cpu);
++			*p_tfm = tfm;
++		}
++
++		p_tfm = this_cpu_ptr(algo->tfms);
++		tfm = *p_tfm;
++
++		shsize = sizeof(*shash) + crypto_shash_descsize(tfm);
++
++		algo->shashs = alloc_percpu(struct shash_desc *);
++		if (!algo->shashs)
++			return -ENOMEM;
++
++		for_each_possible_cpu(cpu) {
++			shash = kzalloc(shsize, GFP_KERNEL);
++			if (!shash)
++				return -ENOMEM;
++			*per_cpu_ptr(algo->shashs, cpu) = shash;
++		}
++	}
++
++	return 0;
++}
++
++int __init seg6_hmac_init(void)
++{
++	int ret;
++
++	ret = seg6_hmac_init_ring();
++	if (ret < 0)
++		goto out;
++
++	ret = seg6_hmac_init_algo();
++
++out:
++	return ret;
++}
++
++void __exit seg6_hmac_exit(void)
++{
++	int i, alg_count, cpu;
++	struct seg6_hmac_algo *algo = NULL;
++
++	for_each_possible_cpu(i) {
++		char *ring = *per_cpu_ptr(hmac_ring, i);
++		kfree(ring);
++	}
++	free_percpu(hmac_ring);
++
++	alg_count = sizeof(hmac_algos)/sizeof(struct seg6_hmac_algo);
++	for (i = 0; i < alg_count; i++) {
++		algo = &hmac_algos[i];
++		for_each_possible_cpu(cpu) {
++			struct crypto_shash *tfm;
++			struct shash_desc *shash;
++
++			shash = *per_cpu_ptr(algo->shashs, cpu);
++			kfree(shash);
++			tfm = *per_cpu_ptr(algo->tfms, cpu);
++			crypto_free_shash(tfm);
++		}
++		free_percpu(algo->tfms);
++		free_percpu(algo->shashs);
++	}
++}
+--- /dev/null
++++ b/net/ipv6/seg6_iptunnel.c
+@@ -0,0 +1,333 @@
++/*
++ *  SR-IPv6 implementation
++ *
++ *  Author:
++ *  David Lebrun <david.lebrun@uclouvain.be>
++ *
++ *
++ *  This program is free software; you can redistribute it and/or
++ *        modify it under the terms of the GNU General Public License
++ *        as published by the Free Software Foundation; either version
++ *        2 of the License, or (at your option) any later version.
++ */
++
++#include <linux/types.h>
++#include <linux/skbuff.h>
++#include <linux/net.h>
++#include <linux/module.h>
++#include <linux/mpls.h>
++#include <linux/vmalloc.h>
++#include <net/ip.h>
++#include <net/dst.h>
++#include <net/lwtunnel.h>
++#include <net/netevent.h>
++#include <net/netns/generic.h>
++#include <net/ip6_fib.h>
++#include <net/route.h>
++#include <net/seg6.h>
++#include <net/seg6_hmac.h>
++#include <linux/seg6.h>
++#include <linux/seg6_iptunnel.h>
++#include <net/addrconf.h>
++#include <net/ip6_route.h>
++
++static const struct nla_policy seg6_iptunnel_policy[SEG6_IPTUNNEL_MAX + 1] = {
++	[SEG6_IPTUNNEL_SRH]	= { .type = NLA_BINARY },
++};
++
++/* utility functions */
++int nla_put_srh(struct sk_buff *skb, int attrtype,
++		struct seg6_iptunnel_encap *tuninfo)
++{
++	struct nlattr *nla;
++	struct seg6_iptunnel_encap *data;
++	int len;
++
++	len = SEG6_IPTUN_ENCAP_SIZE(tuninfo);
++
++	nla = nla_reserve(skb, attrtype, len);
++	if (!nla)
++		return -EMSGSIZE;
++
++	data = nla_data(nla);
++	memcpy(data, tuninfo, len);
++
++	return 0;
++}
++/* -- */
++
++static void __set_tun_src(struct net *net, struct net_device *dev,
++			  struct in6_addr *daddr, struct in6_addr *saddr)
++{
++	struct in6_addr *tun_src;
++	struct seg6_pernet_data *sdata = seg6_pernet(net);
++
++	rcu_read_lock();
++
++	tun_src = rcu_dereference(sdata->tun_src);
++
++	if (!ipv6_addr_any(tun_src)) {
++		memcpy(saddr, tun_src, sizeof(struct in6_addr));
++	} else {
++		ipv6_dev_get_saddr(net, dev, daddr, IPV6_PREFER_SRC_PUBLIC,
++				   saddr);
++	}
++
++	rcu_read_unlock();
++}
++
++static int seg6_do_srh_encap(struct sk_buff *skb, struct ipv6_sr_hdr *osrh)
++{
++	struct ipv6hdr *hdr, *inner_hdr;
++	struct ipv6_sr_hdr *isrh;
++	struct net *net = dev_net(skb_dst(skb)->dev);
++	int hdrlen, tot_len, err;
++
++	hdrlen = (osrh->hdrlen + 1) << 3;
++	tot_len = hdrlen + sizeof(*hdr);
++
++	/* TODO test skb_cow_head */
++	if (unlikely((err = pskb_expand_head(skb, tot_len, 0, GFP_ATOMIC)))) {
++		pr_debug("sr-ipv6: seg6_do_srh_encap: cannot expand head\n");
++		return err;
++	}
++
++	inner_hdr = ipv6_hdr(skb);
++
++	skb_push(skb, tot_len);
++	skb_reset_network_header(skb);
++	skb_mac_header_rebuild(skb);
++	hdr = ipv6_hdr(skb);
++
++	/* inherit tc, flowlabel and hlim
++	 * hlim will be decremented in ip6_forward() afterwards and
++	 * decapsulation will overwrite inner hlim with outer hlim
++	 */
++	ip6_flow_hdr(hdr, ip6_tclass(ip6_flowinfo(inner_hdr)),
++		     ip6_flowlabel(inner_hdr));
++	hdr->hop_limit = inner_hdr->hop_limit;
++	hdr->nexthdr = NEXTHDR_ROUTING;
++
++	isrh = (void *)hdr + sizeof(*hdr);
++	memcpy(isrh, osrh, hdrlen);
++
++	/* still needs to fill nexthdr field */
++	isrh->nexthdr = NEXTHDR_IPV6;
++
++	hdr->daddr = isrh->segments[isrh->first_segment];
++	__set_tun_src(net, skb->dev, &hdr->daddr, &hdr->saddr);
++
++	if (isrh->hmackeyid) {
++		if (unlikely((err = seg6_push_hmac(net, &hdr->saddr, isrh))))
++			return err;
++	}
++
++	return 0;
++}
++
++static int seg6_do_srh_inline(struct sk_buff *skb, struct ipv6_sr_hdr *osrh)
++{
++	struct ipv6hdr *hdr, *oldhdr;
++	struct ipv6_sr_hdr *isrh;
++	struct net *net = dev_net(skb_dst(skb)->dev);
++	int hdrlen, err;
++
++	hdrlen = (osrh->hdrlen + 1) << 3;
++
++	/* TODO test skb_cow_head */
++	if (unlikely((err = pskb_expand_head(skb, hdrlen, 0, GFP_ATOMIC)))) {
++		pr_debug("sr-ipv6: seg6_do_srh_inline: cannot expand head\n");
++		return err;
++	}
++
++	oldhdr = ipv6_hdr(skb);
++
++	skb_push(skb, hdrlen);
++	skb_reset_network_header(skb);
++	skb_mac_header_rebuild(skb);
++
++	hdr = ipv6_hdr(skb);
++
++	memmove(hdr, oldhdr, sizeof(*hdr));
++
++	isrh = (void *)hdr + sizeof(*hdr);
++	memcpy(isrh, osrh, hdrlen);
++
++	isrh->nexthdr = hdr->nexthdr;
++	hdr->nexthdr = NEXTHDR_ROUTING;
++
++	isrh->segments[0] = hdr->daddr;
++	hdr->daddr = isrh->segments[isrh->first_segment];
++
++	if (isrh->hmackeyid) {
++		if (unlikely((err = seg6_push_hmac(net, &hdr->saddr, isrh))))
++			return err;
++	}
++
++	return 0;
++}
++
++
++static int seg6_do_srh(struct sk_buff *skb)
++{
++	struct dst_entry *dst = skb_dst(skb);
++	struct seg6_iptunnel_encap *tinfo = seg6_lwtunnel_encap(dst->lwtstate);
++	int err = 0;
++
++	if (likely(!skb->encapsulation)) {
++		skb_reset_inner_headers(skb);
++		skb->encapsulation = 1;
++	}
++
++	if (tinfo->flags & SEG6_IPTUN_FLAG_ENCAP) {
++		err = seg6_do_srh_encap(skb, tinfo->srh);
++	} else {
++		err = seg6_do_srh_inline(skb, tinfo->srh);
++		skb_reset_inner_headers(skb);
++	}
++
++	if (err)
++		return err;
++
++	ipv6_hdr(skb)->payload_len = htons(skb->len - sizeof(struct ipv6hdr));
++	skb_set_transport_header(skb, sizeof(struct ipv6hdr));
++
++	skb_set_inner_protocol(skb, skb->protocol);
++
++	return 0;
++}
++
++int seg6_input(struct sk_buff *skb)
++{
++	int err;
++
++	if ((unlikely(err = seg6_do_srh(skb))))
++		return err;
++
++	skb_dst_drop(skb);
++	ip6_route_input(skb);
++
++	return dst_input(skb);
++}
++
++int seg6_output(struct net *net, struct sock *sk, struct sk_buff *skb)
++{
++	int err;
++	struct dst_entry *dst;
++	struct ipv6hdr *hdr;
++	struct flowi6 fl6;
++
++	if ((unlikely(err = seg6_do_srh(skb))))
++		return err;
++
++	hdr = ipv6_hdr(skb);
++	fl6.daddr = hdr->daddr;
++	fl6.saddr = hdr->saddr;
++	fl6.flowlabel = ip6_flowinfo(hdr);
++	fl6.flowi6_mark = skb->mark;
++	fl6.flowi6_proto = hdr->nexthdr;
++
++	ip6_route_set_l4flow(skb, &fl6);
++
++	skb_dst_drop(skb);
++
++	if ((unlikely(err = ip6_dst_lookup(net, sk, &dst, &fl6))))
++		return err;
++
++	skb_dst_set(skb, dst);
++
++	return dst_output(net, sk, skb);
++}
++
++static int seg6_build_state(struct net_device *dev, struct nlattr *nla,
++			    unsigned int family, const void *cfg,
++			    struct lwtunnel_state **ts)
++{
++	struct seg6_iptunnel_encap *tuninfo, *tuninfo_new;
++	struct nlattr *tb[SEG6_IPTUNNEL_MAX + 1];
++	struct lwtunnel_state *newts;
++	int tuninfo_len;
++	int err;
++
++	err = nla_parse_nested(tb, SEG6_IPTUNNEL_MAX, nla,
++			       seg6_iptunnel_policy);
++
++	if (err < 0)
++		return err;
++
++	if (!tb[SEG6_IPTUNNEL_SRH])
++		return -EINVAL;
++
++	tuninfo = nla_data(tb[SEG6_IPTUNNEL_SRH]);
++	tuninfo_len = SEG6_IPTUN_ENCAP_SIZE(tuninfo);
++
++	newts = lwtunnel_state_alloc(tuninfo_len);
++	if (!newts)
++		return -ENOMEM;
++
++	newts->len = tuninfo_len;
++	tuninfo_new = seg6_lwtunnel_encap(newts);
++	memcpy(tuninfo_new, tuninfo, tuninfo_len);
++
++	newts->type = LWTUNNEL_ENCAP_SEG6;
++	newts->flags |= LWTUNNEL_STATE_OUTPUT_REDIRECT |
++			LWTUNNEL_STATE_INPUT_REDIRECT;
++
++	*ts = newts;
++
++	return 0;
++}
++
++static int seg6_fill_encap_info(struct sk_buff *skb,
++				struct lwtunnel_state *lwtstate)
++{
++	struct seg6_iptunnel_encap *tuninfo = seg6_lwtunnel_encap(lwtstate);
++
++	if (nla_put_srh(skb, SEG6_IPTUNNEL_SRH, tuninfo))
++		return -EMSGSIZE;
++
++	return 0;
++}
++
++static int seg6_encap_nlsize(struct lwtunnel_state *lwtstate)
++{
++	struct seg6_iptunnel_encap *tuninfo = seg6_lwtunnel_encap(lwtstate);
++
++	return nla_total_size(SEG6_IPTUN_ENCAP_SIZE(tuninfo));
++}
++
++static int seg6_encap_cmp(struct lwtunnel_state *a, struct lwtunnel_state *b)
++{
++	struct seg6_iptunnel_encap *a_hdr = seg6_lwtunnel_encap(a);
++	struct seg6_iptunnel_encap *b_hdr = seg6_lwtunnel_encap(b);
++	int len = SEG6_IPTUN_ENCAP_SIZE(a_hdr);
++
++	if (len != SEG6_IPTUN_ENCAP_SIZE(b_hdr))
++		return 1;
++
++	return memcmp(a_hdr, b_hdr, len);
++}
++
++static const struct lwtunnel_encap_ops seg6_iptun_ops = {
++	.build_state = seg6_build_state,
++	.output = seg6_output,
++	.input = seg6_input,
++	.fill_encap = seg6_fill_encap_info,
++	.get_encap_size = seg6_encap_nlsize,
++	.cmp_encap = seg6_encap_cmp,
++};
++
++static int __init seg6_iptunnel_init(void)
++{
++	return lwtunnel_encap_add_ops(&seg6_iptun_ops, LWTUNNEL_ENCAP_SEG6);
++}
++module_init(seg6_iptunnel_init);
++
++static void __exit seg6_iptunnel_exit(void)
++{
++	lwtunnel_encap_del_ops(&seg6_iptun_ops, LWTUNNEL_ENCAP_SEG6);
++}
++module_exit(seg6_iptunnel_exit);
++
++MODULE_DESCRIPTION("Segment Routing with IPv6 IP Tunnels");
++MODULE_LICENSE("GPL v2");
+--- a/net/ipv6/tcp_ipv6.c
++++ b/net/ipv6/tcp_ipv6.c
+@@ -61,6 +61,7 @@
+ #include <net/timewait_sock.h>
+ #include <net/inet_common.h>
+ #include <net/secure_seq.h>
++#include <net/seg6.h>
+ #include <net/busy_poll.h>
+ 
+ #include <linux/proc_fs.h>
+@@ -1022,6 +1023,9 @@ static struct sock *tcp_v6_syn_recv_sock
+ 	struct tcp_md5sig_key *key;
+ #endif
+ 	struct flowi6 fl6;
++	struct ipv6_txoptions *opt2;
++	struct ipv6_sr_hdr *srhdr;
++	int tot_len;
+ 
+ 	if (skb->protocol == htons(ETH_P_IP)) {
+ 		/*
+@@ -1145,6 +1149,31 @@ static struct sock *tcp_v6_syn_recv_sock
+ 	opt = ireq->ipv6_opt;
+ 	if (!opt)
+ 		opt = rcu_dereference(np->opt);
++
++	/* If there is no matching entry for peer and no previous option was
++	 * defined, and there is already an SRH present in the SYN packet,
++	 * and we allow SRH reversal, then apply reversed SRH to all future
++	 * packets of the connection.
++	 */
++	if (!opt && IP6CB(skb)->srcrt > 0 && np->srhreverse) {
++		srhdr = (struct ipv6_sr_hdr *)skb_network_header(skb) +
++			IP6CB(skb)->srcrt;
++
++		/* do not copy hmac */
++		tot_len = CMSG_ALIGN((SEG6_SRH_SEGSIZE(srhdr) * 16 + 8));
++		tot_len += sizeof(*opt2);
++
++		opt2 = sock_kmalloc(newsk, tot_len, GFP_ATOMIC);
++		memset(opt2, 0, tot_len);
++
++		seg6_srh_to_tmpl(srhdr, (struct ipv6_sr_hdr *)(opt2 + 1), 1);
++
++		opt2->srcrt = (struct ipv6_rt_hdr *)(opt2 + 1);
++		opt2->opt_nflen = ipv6_optlen(opt2->srcrt);
++
++		RCU_INIT_POINTER(newnp->opt, opt2);
++	}
++
+ 	if (opt) {
+ 		opt = ipv6_dup_options(newsk, opt);
+ 		RCU_INIT_POINTER(newnp->opt, opt);
